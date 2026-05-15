@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+.trae/
+debug_*.py
+debug_*.html
+explore_*.py
+main_debug.js
+modules_debug.js
+config.json
+.env
