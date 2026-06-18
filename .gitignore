@@ -5,7 +5,12 @@ __pycache__/
 debug_*.py
 debug_*.html
 explore_*.py
-main_debug.js
-modules_debug.js
+test_*.py
+search_*.py
+search_results*.txt
+*.png
+chunks/
 config.json
+config.yaml
 .env
+cookies.json
