@@ -563,7 +563,9 @@ class CookieManager:
 # ═══════════════════════════════════════════════════════════════
 
 class CaptchaSolver:
-    """验证码识别器 - 使用ddddocr"""
+    """验证码识别器 - 使用ddddocr + 多策略预处理融合"""
+
+    CAPTCHA_LEN = 4  # ZZU CAS验证码固定4位
 
     def __init__(self):
         self._ocr = None
@@ -583,29 +585,88 @@ class CaptchaSolver:
         except Exception as e:
             raise EvalNetworkError(f"下载验证码失败: {e}")
 
+    def _preprocess_variants(self, image_bytes):
+        """生成多种预处理版本，提高识别鲁棒性"""
+        from PIL import Image, ImageFilter, ImageOps
+        import io as _io
+
+        img = Image.open(_io.BytesIO(image_bytes))
+        variants = []
+
+        # 0: 原图
+        variants.append(image_bytes)
+
+        # 1: 灰度+autocontrast+二值化(128)
+        gray = img.convert('L')
+        ac = ImageOps.autocontrast(gray, cutoff=10)
+        bin1 = ac.point(lambda x: 255 if x > 128 else 0)
+        buf = _io.BytesIO(); bin1.save(buf, format='PNG'); variants.append(buf.getvalue())
+
+        # 2: 灰度+autocontrast(cutoff=20)+二值化(100)
+        ac2 = ImageOps.autocontrast(gray, cutoff=20)
+        bin2 = ac2.point(lambda x: 255 if x > 100 else 0)
+        buf = _io.BytesIO(); bin2.save(buf, format='PNG'); variants.append(buf.getvalue())
+
+        # 3: 灰度+锐化+二值化
+        sharp = ImageOps.autocontrast(gray, cutoff=10).filter(ImageFilter.SHARPEN)
+        bin3 = sharp.point(lambda x: 255 if x > 128 else 0)
+        buf = _io.BytesIO(); bin3.save(buf, format='PNG'); variants.append(buf.getvalue())
+
+        return variants
+
     def solve(self, image_bytes):
-        """OCR识别验证码"""
+        """OCR识别验证码 - 多策略预处理融合"""
         if not self._ocr:
             raise EvalError("ddddocr未安装，无法识别验证码。请运行: pip install ddddocr")
-        try:
-            result = self._ocr.classification(image_bytes)
-            return result.strip()
-        except Exception as e:
-            raise EvalError(f"验证码识别失败: {e}")
+
+        from collections import Counter
+        variants = self._preprocess_variants(image_bytes)
+        results = []
+        for v in variants:
+            try:
+                r = self._ocr.classification(v).strip()
+                results.append(r)
+            except Exception:
+                pass
+
+        if not results:
+            raise EvalError("验证码识别失败: 所有预处理方案均无结果")
+
+        # 优先取4字符结果，多数投票
+        len_ok = [r for r in results if len(r) == self.CAPTCHA_LEN]
+        if len_ok:
+            return Counter(len_ok).most_common(1)[0][0]
+
+        # 没有4字符的，取最长的
+        return max(results, key=len)
 
     def solve_captcha(self, session, base_url=CAS_BASE, max_retries=3):
-        """下载并识别验证码，带重试"""
+        """下载并识别验证码，多策略融合+重试"""
+        from collections import Counter
+
+        all_results = []
         for attempt in range(max_retries):
             try:
                 image_bytes = self.download_captcha(session, base_url)
                 code = self.solve(image_bytes)
-                if code and len(code) >= 4:
-                    return code
-                print(f"    [!] 验证码识别结果过短: '{code}'，重试 {attempt + 1}/{max_retries}")
+                if code and len(code) >= self.CAPTCHA_LEN:
+                    all_results.append(code)
+                    # 继续尝试，积累更多结果做投票
+                else:
+                    print(f"    [!] 验证码识别结果过短: '{code}'，重试 {attempt + 1}/{max_retries}")
             except EvalError:
                 raise
             except Exception as e:
                 print(f"    [!] 验证码处理失败: {e}，重试 {attempt + 1}/{max_retries}")
+
+        # 从所有4字符结果中投票
+        len4 = [r for r in all_results if len(r) >= self.CAPTCHA_LEN]
+        if len4:
+            return Counter(len4).most_common(1)[0][0]
+
+        # 没有4字符结果
+        if all_results:
+            return all_results[-1]
         return None
 
 
