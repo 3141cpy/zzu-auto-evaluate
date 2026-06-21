@@ -303,7 +303,7 @@ class EvalAPIClient:
 
         return self._parse_old_response(resp, api_name)
 
-    def call_apiservice(self, api_name, request_params=None, token=None, encrypted=True):
+    def call_apiservice(self, api_name, request_params=None, token=None):
         """调用新版API: POST /apiservice/{api_name}
 
         SPA实际格式：发送加密的 {SystemParams, RequestParams}，SystemParams包含SERVICE_TYPE="apiservice"
@@ -327,7 +327,7 @@ class EvalAPIClient:
 
         return self._parse_apiservice_response(resp, api_name)
 
-    def call_questionnaire(self, api_name, request_params=None, token=None, encrypted=True):
+    def call_questionnaire(self, api_name, request_params=None, token=None):
         """调用问卷API: POST /questionnaire/{api_name}
 
         SPA实际格式：发送加密的 {SystemParams, RequestParams}，SystemParams包含SERVICE_TYPE="questionnaire"
@@ -445,7 +445,7 @@ class CookieManager:
                 data = json.load(f)
             if isinstance(data, list):
                 # 旧格式：纯数组
-                return {"cookies": data, "fp_visitor_id": ""}
+                return {"cookies": data, "fp_visitor_id": "00000000000000000000000000000000"}
             elif isinstance(data, dict):
                 # 新格式：dict with cookies key
                 return data
@@ -468,7 +468,7 @@ class CookieManager:
 
         # 读取现有文件，保留fp_visitor_id
         existing = self._read_cookie_file()
-        fp_visitor_id = ""
+        fp_visitor_id = "00000000000000000000000000000000"
         if existing and existing.get("fp_visitor_id"):
             fp_visitor_id = existing["fp_visitor_id"]
 
@@ -527,7 +527,7 @@ class CookieManager:
 
     def save_fp_visitor_id(self, fp_id):
         """保存fp_visitor_id到Cookie文件"""
-        existing = self._read_cookie_file() or {"cookies": [], "fp_visitor_id": ""}
+        existing = self._read_cookie_file() or {"cookies": [], "fp_visitor_id": "00000000000000000000000000000000"}
         existing["fp_visitor_id"] = fp_id
         try:
             with open(self.COOKIE_PATH, 'w', encoding='utf-8') as f:
@@ -836,6 +836,17 @@ class LoginStrategy(Enum):
 class EvalAuth:
     """认证管理器 - 支持多种登录策略"""
 
+    FORM_HEADERS = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Origin": CAS_BASE,
+        "Referer": f"{CAS_LOGIN_URL}?service={quote(CAS_SERVICE_URL)}",
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "same-origin",
+        "sec-fetch-user": "?1",
+        "upgrade-insecure-requests": "1",
+    }
+
     def __init__(self, api_client, cookie_manager=None):
         self.api_client = api_client
         self.cookie_manager = cookie_manager or CookieManager()
@@ -992,20 +1003,10 @@ class EvalAuth:
                     "trustAgent": "true",
                     "submit1": "Login1",
                 }
-                form_headers = {
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Origin": CAS_BASE,
-                    "Referer": f"{CAS_LOGIN_URL}?service={quote(CAS_SERVICE_URL)}",
-                    "sec-fetch-dest": "document",
-                    "sec-fetch-mode": "navigate",
-                    "sec-fetch-site": "same-origin",
-                    "sec-fetch-user": "?1",
-                    "upgrade-insecure-requests": "1",
-                }
                 resp = session.post(
                     f"{CAS_LOGIN_URL}?service={CAS_SERVICE_URL}",
                     data=form_data,
-                    headers=form_headers,
+                    headers=self.FORM_HEADERS,
                     allow_redirects=False,
                     timeout=30,
                 )
@@ -1064,7 +1065,26 @@ class EvalAuth:
                 )
                 print("    [MFA] 短信验证码已发送")
             else:
-                raise EvalAuthError("无法获取短信验证服务信息，请稍后重试")
+                print("    [MFA] 尝试发送短信验证码...")
+                try:
+                    init_resp = session.get(
+                        f"{CAS_BASE}/mfa/initByType/securephone",
+                        params={"state": mfa_state},
+                        timeout=15,
+                    )
+                    if init_resp.status_code == 200:
+                        try:
+                            init_data = init_resp.json()
+                        except Exception:
+                            init_data = {}
+                        if not attest_server_url:
+                            attest_server_url = init_data.get("attestServerUrl", "")
+                        if not gid:
+                            gid = init_data.get("gid", "")
+                except Exception:
+                    pass
+                if not attest_server_url or not gid:
+                    raise EvalAuthError("无法获取短信验证服务信息，发送验证码失败")
 
             # Step 4: 用户输入验证码
             sms_code = input("    请输入收到的短信验证码: ").strip()
@@ -1082,6 +1102,8 @@ class EvalAuth:
                 if valid_data.get("data", {}).get("status") != 2:
                     raise EvalAuthError("短信验证码错误，请检查后重试")
                 print("    [MFA] 短信验证码校验通过")
+            else:
+                raise EvalAuthError("无法验证短信验证码：缺少验证服务信息")
 
             # 询问是否设为可信客户端
             trust_choice = input("    是否将当前设备设为可信客户端？后续登录可跳过安全验证 (y/n): ").strip().lower()
@@ -1108,21 +1130,11 @@ class EvalAuth:
                 "trustAgent": trust_agent,
                 "submit1": "Login1",
             }
-            mfa_headers = {
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Origin": CAS_BASE,
-                "Referer": f"{CAS_LOGIN_URL}?service={quote(CAS_SERVICE_URL)}",
-                "sec-fetch-dest": "document",
-                "sec-fetch-mode": "navigate",
-                "sec-fetch-site": "same-origin",
-                "sec-fetch-user": "?1",
-                "upgrade-insecure-requests": "1",
-            }
             try:
                 resp = session.post(
                     f"{CAS_LOGIN_URL}?service={CAS_SERVICE_URL}",
                     data=mfa_form_data,
-                    headers=mfa_headers,
+                    headers=self.FORM_HEADERS,
                     allow_redirects=False,
                     timeout=30,
                 )
@@ -1159,8 +1171,6 @@ class EvalAuth:
             raise
         except Exception as e:
             raise EvalAuthError(f"MFA验证流程失败: {e}")
-
-        return self._follow_deal_sso(resp)
 
     def _cas_sso_login_with_mfa(self, username, password):
         """CAS SSO登录 - 自动处理MFA"""
@@ -1212,22 +1222,12 @@ class EvalAuth:
             "trustAgent": "",
             "submit1": "Login1",
         }
-        form_headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Origin": CAS_BASE,
-            "Referer": f"{CAS_LOGIN_URL}?service={quote(CAS_SERVICE_URL)}",
-            "sec-fetch-dest": "document",
-            "sec-fetch-mode": "navigate",
-            "sec-fetch-site": "same-origin",
-            "sec-fetch-user": "?1",
-            "upgrade-insecure-requests": "1",
-        }
 
         try:
             resp = session.post(
                 f"{CAS_LOGIN_URL}?service={CAS_SERVICE_URL}",
                 data=form_data,
-                headers=form_headers,
+                headers=self.FORM_HEADERS,
                 allow_redirects=False,
                 timeout=30,
             )
@@ -1291,7 +1291,7 @@ class EvalAuth:
             resp.raise_for_status()
             public_key = resp.text.strip()
         except Exception as e:
-            raise RuntimeError(f"获取RSA公钥失败: {e}，无法安全加密密码，登录终止") from e
+            raise EvalAuthError(f"获取RSA公钥失败: {e}，无法安全加密密码，登录终止") from e
 
         try:
             from Crypto.PublicKey import RSA
@@ -1301,7 +1301,7 @@ class EvalAuth:
             encrypted = cipher.encrypt(password.encode('utf-8'))
             return "__RSA__" + base64.b64encode(encrypted).decode('utf-8')
         except Exception as e:
-            raise RuntimeError(f"RSA加密失败: {e}，无法安全加密密码，登录终止") from e
+            raise EvalAuthError(f"RSA加密失败: {e}，无法安全加密密码，登录终止") from e
 
     def _follow_deal_sso(self, initial_response):
         """手动跟随重定向，提取token"""
@@ -1361,7 +1361,6 @@ class EvalAuth:
                 "Login/GetUserContextByToken",
                 request_params=sso_token,
                 token=sso_token,
-                encrypted=False,
             )
             if isinstance(result, dict):
                 user_info = result.get("Value", result.get("Data", result))
@@ -1580,19 +1579,18 @@ class EvalAuth:
                     pass
 
                 # 等待页面完全加载后再检查URL
-                if not token:
-                    try:
-                        self._page.wait_for_load_state("networkidle", timeout=5000)
-                        final_url = self._page.url
-                        token = CookieManager._extract_token_from_url(final_url)
-                        if token:
-                            return token
-                        # 再次检查localStorage
-                        local_token = self._page.evaluate("() => localStorage.getItem('token')")
-                        if local_token:
-                            return local_token
-                    except Exception:
-                        pass
+                try:
+                    self._page.wait_for_load_state("networkidle", timeout=5000)
+                    final_url = self._page.url
+                    token = CookieManager._extract_token_from_url(final_url)
+                    if token:
+                        return token
+                    # 再次检查localStorage
+                    local_token = self._page.evaluate("() => localStorage.getItem('token')")
+                    if local_token:
+                        return local_token
+                except Exception:
+                    pass
 
             # 如果在CAS页面且需要MFA，提示用户
             if "cas.s.zzu.edu.cn" in current_url and not mfa_prompted:
@@ -1687,9 +1685,8 @@ class EvalAutoFiller:
     5. _submit_single_course → Mycos.JP.Questionnaire.SaveAnswer (old_api)
     """
 
-    def __init__(self, api_client, auth):
+    def __init__(self, api_client):
         self.api_client = api_client
-        self.auth = auth
         self._rsa_public_key = None  # 缓存RSA公钥
 
     def get_unfinished_tasks(self):
@@ -2058,7 +2055,7 @@ class ZZUAutoEvaluate:
         self.api_client = EvalAPIClient()
         self.cookie_manager = CookieManager()
         self.auth = EvalAuth(self.api_client, self.cookie_manager)
-        self.filler = EvalAutoFiller(self.api_client, self.auth)
+        self.filler = EvalAutoFiller(self.api_client)
 
         self._token = None
         self._user_info = None
