@@ -5,7 +5,9 @@
 ## 功能特点
 
 - **API直连模式**：直接调用评价系统API提交评价，无需浏览器自动化，速度快、稳定性高
-- **自动登录**：支持 Playwright 浏览器登录 + Cookie复用 + Chrome Cookie导入
+- **多种登录策略**：Cookie复用 → Chrome Cookie导入 → API+MFA登录 → Playwright回退
+- **可信客户端**：MFA验证时可设为可信设备，后续登录自动跳过安全验证
+- **TGC复用**：有效TGC Cookie自动跳过整个登录流程
 - **全类型覆盖**：自动识别理论课、实验课等不同问卷类型，逐一提交
 - **AuthKey加密**：RSA-1024加密生成AuthKey，确保提交合法性
 - **教师筛选**：支持白名单/黑名单模式，灵活指定评价范围
@@ -16,7 +18,12 @@
 ### 安装依赖
 
 ```bash
-pip install playwright pycryptodome
+pip install pycryptodome beautifulsoup4 requests
+```
+
+如需Playwright浏览器登录（回退方案）：
+```bash
+pip install playwright
 playwright install chromium
 ```
 
@@ -26,10 +33,23 @@ playwright install chromium
 python auto_evaluate.py -u 学号 -p 密码
 ```
 
-### 显示浏览器窗口（调试模式）
+### 登录策略
 
 ```bash
-python auto_evaluate.py -u 学号 -p 密码 --no-headless
+# 自动策略（默认）：依次尝试 Cookie复用 → Chrome导入 → API+MFA → Playwright
+python auto_evaluate.py -u 学号 -p 密码
+
+# 仅API+MFA登录
+python auto_evaluate.py -u 学号 -p 密码 --strategy api_mfa
+
+# Cookie复用登录
+python auto_evaluate.py -u 学号 --strategy cookie_reuse
+
+# Chrome Cookie导入
+python auto_evaluate.py -u 学号 --cookie-import
+
+# Playwright浏览器登录
+python auto_evaluate.py -u 学号 -p 密码 --strategy playwright
 ```
 
 ### 教师筛选
@@ -51,27 +71,47 @@ python auto_evaluate.py -u 学号 -p 密码 --blacklist 王老师
   ZZU 教学评价自动提交程序
 ==================================================
 
-[1] 登录中...
-    登录成功: 张三
+[1] 登录中... (策略: auto)
+    [CAS] TGC有效，跳过登录直接签发ticket
+[✓] 登录成功！用户: 张三
 
 [2] 获取未完成任务列表...
     共找到 1 个未完成任务
-    2025-2026-2学期期末学生评价（校级） [3/17]
+    1. 2025-2026-2学期期末学生评价（校级） (期末评价) [3/17]
 
 [3] 开始自动填写评价...
 
-  [1/1] 2025-2026-2学期期末学生评价（校级）
-      子问卷课程: 物理实验 (QuestionnaireId=23)
-      [1/1] 物理实验 - 李老师
-      [1/16] 高等数学 - 王老师
-      [2/16] 大学英语 - 赵老师
-      ...
-      [16/16] 思想道德修养 - 刘老师
+  [1/1] 2025-2026-2学期期末学生评价（校级） (期末评价) [3/17]
+    [1/14] 高等数学 - 王老师
+    [2/14] 大学英语 - 赵老师
+    ...
+    [14/14] 思想道德修养 - 刘老师
   [✓] 成功提交14门课程评价
 
 ==================================================
-  评价完成！
+  评价完成！总计: 1 | 成功: 1 | 失败: 0
 ==================================================
+```
+
+### 首次登录（含MFA）
+
+```
+[1] 登录中... (策略: api_mfa)
+    [MFA] 安全手机: 138****1234
+    [MFA] 短信验证码已发送
+    请输入收到的短信验证码: 1234
+    [MFA] 短信验证成功！
+    是否将当前设备设为可信客户端？后续登录可跳过安全验证 (y/n): y
+    [✓] 已设为可信客户端
+[✓] 登录成功！
+```
+
+### 可信设备再次登录
+
+```
+[1] 登录中... (策略: api_mfa)
+    [MFA] 当前设备已信任，跳过安全验证
+[✓] 登录成功！
 ```
 
 ## 参数说明
@@ -80,6 +120,8 @@ python auto_evaluate.py -u 学号 -p 密码 --blacklist 王老师
 |------|------|------|------|
 | `--username` | `-u` | 是 | 学号 |
 | `--password` | `-p` | 否 | 密码（Cookie复用/导入时可选） |
+| `--strategy` | | 否 | 登录策略：auto(默认)、cookie_reuse、api_mfa、playwright、cookie_import |
+| `--cookie-import` | | 否 | 启用Chrome Cookie导入 |
 | `--whitelist` | | 否 | 教师白名单，仅评价这些教师的课程 |
 | `--blacklist` | | 否 | 教师黑名单，排除这些教师的课程 |
 | `--no-headless` | | 否 | 显示浏览器窗口（调试用） |
@@ -109,20 +151,35 @@ finally:
 
 ## 工作原理
 
-1. **登录**：Playwright 打开 CAS 统一认证平台，完成登录后从重定向中提取 Token
-2. **获取任务列表**：调用 `GetMyTaskItemByAnswerStatus` API（AES-ECB 加密请求体）
-3. **获取课程列表**：调用 `GetFinalQuestionnaireHeaderAsync` 获取教师列表（含DetailId和AnswerStatus）
-4. **发现子问卷**：调用 `GetMyTaskItemDetailAsync` 发现使用不同问卷的课程（如实验课）
-5. **生成AuthKey**：RSA-1024加密 `DetailId&PersonCode`，公钥来自 `Login/GetPublicKey`
-6. **提交评价**：调用 `SaveAnswer` API，选择题选"非常同意"，文本题填正向评价
-7. **汇总报告**：输出每个课程的评价结果和统计数据
+### 登录流程
+
+1. **Cookie复用**：加载已保存的TGC Cookie，如有效则直接签发ticket，跳过整个登录流程
+2. **Chrome Cookie导入**：从本地Chrome浏览器导入CAS Cookie
+3. **API+MFA登录**：
+   - 访问CAS登录页，获取execution参数
+   - RSA加密密码，提交登录表单
+   - 如需MFA：调用detect接口检查设备是否已信任
+     - 已信任设备（`need=False`）：直接跳过MFA
+     - 未信任设备：发送短信验证码 → 用户输入 → 验证 → 可选设为可信客户端
+   - 跟随SSO重定向获取Token
+4. **Playwright回退**：以上方式均失败时，使用浏览器自动化登录
+
+### 评价流程
+
+1. **获取任务列表**：调用 `GetMyTaskItemByAnswerStatus` API（AES-ECB 加密请求体）
+2. **获取课程列表**：调用 `GetFinalQuestionnaireHeaderAsync` 获取教师列表
+3. **发现子问卷**：调用 `GetMyTaskItemDetailAsync` 发现使用不同问卷的课程（如实验课）
+4. **生成AuthKey**：RSA-1024加密 `DetailId&PersonCode`
+5. **提交评价**：调用 `SaveAnswer` API，选择题选"非常同意"，文本题填正向评价
+6. **汇总报告**：输出每个课程的评价结果和统计数据
 
 ## 技术细节
 
 - **加密方式**：AES-ECB（与前端SPA保持协议兼容），Base64 输出
 - **AuthKey**：RSA-1024 + PKCS1_v1_5，加密 `DetailId&PersonCode`，输出hex字符串
 - **Token管理**：从CAS登录重定向提取，存入Cookie复用文件
-- **Cookie存储**：`~/.zzu_eval_cookies.json`，权限0600
+- **Cookie存储**：`~/.zzu_eval_cookies.json`，权限0600，包含cookies和fp_visitor_id
+- **可信客户端**：基于fpVisitorId标识设备，CAS detect接口返回`need=False`时跳过MFA
 
 ## 文件说明
 
@@ -135,12 +192,13 @@ finally:
 - 密码通过RSA加密后传输，不会以明文形式发送
 - Cookie文件存储在用户主目录，权限设为仅所有者可读
 - AES加密密钥为前端SPA内置密钥，用于API协议兼容，非用户凭据
+- fpVisitorId为随机生成的设备指纹，用于可信客户端功能
 - 建议使用后及时清理Cookie文件
 
 ## 注意事项
 
-- 请确保网络连接稳定，程序运行期间不要手动操作浏览器窗口
-- 如遇到验证码或其他人工验证，请使用 `--no-headless` 模式手动处理
+- 请确保网络连接稳定
+- 首次登录需输入短信验证码，建议选择"设为可信客户端"以便后续自动登录
 - 本工具仅供学习交流使用，请合理使用
 
 ## License

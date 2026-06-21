@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ZZU 教学评价自动提交程序 - 增强版
 
-支持: Cookie复用、验证码识别、MFA、Chrome Cookie导入、API直连、Playwright回退
+支持: Cookie复用(TGC跳过MFA)、MFA短信验证、Chrome Cookie导入、API直连、Playwright回退
 """
 
 import random
@@ -11,14 +11,12 @@ import argparse
 import os
 import re
 import shutil
-import struct
 import tempfile
+import secrets
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote, quote
-
-import hashlib
 
 import requests
 from bs4 import BeautifulSoup
@@ -31,12 +29,6 @@ try:
     _HAS_PYCRYPTODOME = True
 except ImportError:
     _HAS_PYCRYPTODOME = False
-
-try:
-    import ddddocr
-    _HAS_DDDDOCR = True
-except ImportError:
-    _HAS_DDDDOCR = False
 
 try:
     from playwright.sync_api import sync_playwright
@@ -144,12 +136,10 @@ def _clean_nulls(text):
 
 BASE_URL = "https://jxpj.v.zzu.edu.cn"
 LOGIN_URL = f"{BASE_URL}/index.html?v=3.41.0"
-CRYPTOJS_URL = "https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.2.0/crypto-js.min.js"
 
 CAS_BASE = "https://cas.s.zzu.edu.cn/cas"
 CAS_LOGIN_URL = f"{CAS_BASE}/a/login"
 CAS_PUBLIC_KEY_URL = f"{CAS_BASE}/jwt/publicKey"
-CAS_CAPTCHA_URL = f"{CAS_BASE}/captcha.jpg"
 DEAL_SSO_URL = f"{BASE_URL}/DealSSO.ashx/?universitycode=10459_1"
 CAS_SERVICE_URL = DEAL_SSO_URL
 
@@ -170,11 +160,6 @@ RATING_REASON_COMMENTS = [
     "教师教学经验丰富，课堂互动性强，能够深入浅出地讲解重点难点，学生收获很大。",
 ]
 
-# 评分关键词
-POSITIVE_KEYWORDS = ["非常同意", "非常满意", "很好", "优秀", "完全", "非常"]
-NEGATIVE_KEYWORDS = ["不同意", "不满意", "很差", "较差", "反对"]
-TAG_NEGATIVE_KEYWORDS = ["不", "差", "少", "缺", "慢", "懒"]
-
 
 # ═══════════════════════════════════════════════════════════════
 # 3. API Client Class
@@ -190,12 +175,16 @@ class EvalAPIClient:
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
                           '(KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 Edg/144.0.0.0',
             'Accept': 'application/json, text/plain, */*',
+            'sec-ch-ua': '"Microsoft Edge";v="144", "Chromium";v="144", "Not)A;Brand";v="24"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"',
         })
         self.token = None
         self.user_code = None
         self.university_code = None
         self.semester = None
-        self._client_id = self._generate_client_id()
+        self._client_id = secrets.token_hex(16)
+        self._fp_visitor_id = None
 
     def set_token(self, token):
         self.token = token
@@ -206,11 +195,15 @@ class EvalAPIClient:
         if semester:
             self.semester = semester
 
-    @staticmethod
-    def _generate_client_id():
-        """生成浏览器指纹hash (ClientId)"""
-        import secrets
-        return secrets.token_hex(16)
+    @property
+    def fp_visitor_id(self):
+        """获取fpVisitorId（持久化的浏览器指纹）"""
+        return self._fp_visitor_id
+
+    @fp_visitor_id.setter
+    def fp_visitor_id(self, value):
+        """设置fpVisitorId"""
+        self._fp_visitor_id = value
 
     @staticmethod
     def _clean_nulls(obj, recursive=True):
@@ -444,8 +437,25 @@ class CookieManager:
 
     COOKIE_PATH = Path.home() / ".zzu_eval_cookies.json"
 
+    def _read_cookie_file(self):
+        """读取Cookie文件，返回dict格式（兼容旧格式）"""
+        if not self.COOKIE_PATH.exists():
+            return None
+        try:
+            with open(self.COOKIE_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                # 旧格式：纯数组
+                return {"cookies": data, "fp_visitor_id": ""}
+            elif isinstance(data, dict):
+                # 新格式：dict with cookies key
+                return data
+            return None
+        except Exception:
+            return None
+
     def save_cookies(self, session, domain_filter=None):
-        """从requests.Session保存Cookie到JSON"""
+        """从requests.Session保存Cookie到JSON（新格式）"""
         cookies = []
         for cookie in session.cookies:
             if domain_filter and domain_filter not in (cookie.domain or ""):
@@ -456,9 +466,21 @@ class CookieManager:
                 "domain": cookie.domain,
                 "path": cookie.path,
             })
+
+        # 读取现有文件，保留fp_visitor_id
+        existing = self._read_cookie_file()
+        fp_visitor_id = ""
+        if existing and existing.get("fp_visitor_id"):
+            fp_visitor_id = existing["fp_visitor_id"]
+
+        save_data = {
+            "cookies": cookies,
+            "fp_visitor_id": fp_visitor_id,
+        }
+
         try:
             with open(self.COOKIE_PATH, 'w', encoding='utf-8') as f:
-                json.dump(cookies, f, ensure_ascii=False, indent=2)
+                json.dump(save_data, f, ensure_ascii=False, indent=2)
             # 设置文件权限为仅所有者可读写
             try:
                 os.chmod(self.COOKIE_PATH, 0o600)
@@ -470,12 +492,14 @@ class CookieManager:
             return False
 
     def load_cookies(self, session, domain_filter=None):
-        """从JSON加载Cookie到requests.Session"""
+        """从JSON加载Cookie到requests.Session（兼容旧格式）"""
         if not self.has_valid_cookies():
             return False
         try:
-            with open(self.COOKIE_PATH, 'r', encoding='utf-8') as f:
-                cookies = json.load(f)
+            data = self._read_cookie_file()
+            if data is None:
+                return False
+            cookies = data.get("cookies", []) if isinstance(data, dict) else data
             for c in cookies:
                 if domain_filter and domain_filter not in (c.get("domain") or ""):
                     continue
@@ -490,15 +514,40 @@ class CookieManager:
             return False
 
     def has_valid_cookies(self):
-        """检查Cookie文件是否存在且非空"""
+        """检查Cookie文件是否存在且非空（兼容旧格式）"""
         try:
-            if not self.COOKIE_PATH.exists():
+            data = self._read_cookie_file()
+            if data is None:
                 return False
-            with open(self.COOKIE_PATH, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+            if isinstance(data, dict):
+                cookies = data.get("cookies", [])
+                return bool(cookies)
             return bool(data)
         except Exception:
             return False
+
+    def save_fp_visitor_id(self, fp_id):
+        """保存fp_visitor_id到Cookie文件"""
+        existing = self._read_cookie_file() or {"cookies": [], "fp_visitor_id": ""}
+        existing["fp_visitor_id"] = fp_id
+        try:
+            with open(self.COOKIE_PATH, 'w', encoding='utf-8') as f:
+                json.dump(existing, f, ensure_ascii=False, indent=2)
+            try:
+                os.chmod(self.COOKIE_PATH, 0o600)
+            except OSError:
+                pass
+        except Exception as e:
+            print(f"    [!] 保存fp_visitor_id失败: {e}")
+
+    def load_fp_visitor_id(self):
+        """从Cookie文件加载fp_visitor_id，未找到返回None"""
+        data = self._read_cookie_file()
+        if data and isinstance(data, dict):
+            fp_id = data.get("fp_visitor_id", "")
+            if fp_id:
+                return fp_id
+        return None
 
     def clear_cookies(self):
         """删除Cookie文件"""
@@ -559,109 +608,7 @@ class CookieManager:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 5. Captcha Solver Class
-# ═══════════════════════════════════════════════════════════════
-
-class CaptchaSolver:
-    """验证码识别器 - 使用ddddocr + 多策略预处理融合"""
-
-    CAPTCHA_LEN = 4  # ZZU CAS验证码固定4位
-
-    def __init__(self):
-        self._ocr = None
-        if _HAS_DDDDOCR:
-            try:
-                self._ocr = ddddocr.DdddOcr(show_ad=False)
-            except Exception:
-                self._ocr = ddddocr.DdddOcr()
-
-    def download_captcha(self, session, base_url=CAS_BASE):
-        """下载验证码图片"""
-        url = f"{base_url}/captcha.jpg"
-        try:
-            resp = session.get(url, timeout=15)
-            resp.raise_for_status()
-            return resp.content
-        except Exception as e:
-            raise EvalNetworkError(f"下载验证码失败: {e}")
-
-    def _preprocess_variants(self, image_bytes):
-        """生成多种预处理版本，提高识别鲁棒性"""
-        from PIL import Image, ImageFilter, ImageOps
-        import io as _io
-
-        img = Image.open(_io.BytesIO(image_bytes))
-        variants = []
-
-        # 0: 原图
-        variants.append(image_bytes)
-
-        # 1: 灰度+autocontrast+二值化(128)
-        gray = img.convert('L')
-        ac = ImageOps.autocontrast(gray, cutoff=10)
-        bin1 = ac.point(lambda x: 255 if x > 128 else 0)
-        buf = _io.BytesIO(); bin1.save(buf, format='PNG'); variants.append(buf.getvalue())
-
-        # 2: 灰度+autocontrast(cutoff=20)+二值化(100)
-        ac2 = ImageOps.autocontrast(gray, cutoff=20)
-        bin2 = ac2.point(lambda x: 255 if x > 100 else 0)
-        buf = _io.BytesIO(); bin2.save(buf, format='PNG'); variants.append(buf.getvalue())
-
-        # 3: 灰度+锐化+二值化
-        sharp = ImageOps.autocontrast(gray, cutoff=10).filter(ImageFilter.SHARPEN)
-        bin3 = sharp.point(lambda x: 255 if x > 128 else 0)
-        buf = _io.BytesIO(); bin3.save(buf, format='PNG'); variants.append(buf.getvalue())
-
-        return variants
-
-    def solve(self, image_bytes):
-        """OCR识别验证码 - 多策略预处理融合"""
-        if not self._ocr:
-            raise EvalError("ddddocr未安装，无法识别验证码。请运行: pip install ddddocr")
-
-        from collections import Counter
-        variants = self._preprocess_variants(image_bytes)
-        results = []
-        for v in variants:
-            try:
-                r = self._ocr.classification(v).strip()
-                results.append(r)
-            except Exception:
-                pass
-
-        if not results:
-            raise EvalError("验证码识别失败: 所有预处理方案均无结果")
-
-        # 优先取4字符结果，多数投票
-        len_ok = [r for r in results if len(r) == self.CAPTCHA_LEN]
-        if len_ok:
-            return Counter(len_ok).most_common(1)[0][0]
-
-        # 没有4字符的，取最长的
-        return max(results, key=len)
-
-    def solve_captcha(self, session, base_url=CAS_BASE, max_retries=3):
-        """下载并识别验证码，多策略预处理融合+重试
-        
-        注意：CAS每次下载验证码会使前一个失效，所以每次只下载一张，
-        用多策略预处理融合提高单次识别率。只有识别失败才重新下载。
-        """
-        for attempt in range(max_retries):
-            try:
-                image_bytes = self.download_captcha(session, base_url)
-                code = self.solve(image_bytes)
-                if code and len(code) >= self.CAPTCHA_LEN:
-                    return code
-                print(f"    [!] 验证码识别结果过短: '{code}'，重试 {attempt + 1}/{max_retries}")
-            except EvalError:
-                raise
-            except Exception as e:
-                print(f"    [!] 验证码处理失败: {e}，重试 {attempt + 1}/{max_retries}")
-        return None
-
-
-# ═══════════════════════════════════════════════════════════════
-# 6. Chrome Cookie Importer Class
+# 5. Chrome Cookie Importer Class
 # ═══════════════════════════════════════════════════════════════
 
 class CookieImporter:
@@ -876,13 +823,12 @@ class CookieImporter:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 7. Auth Class
+# 6. Auth Class
 # ═══════════════════════════════════════════════════════════════
 
 class LoginStrategy(Enum):
     AUTO = "auto"
     COOKIE_REUSE = "cookie_reuse"
-    API_CAPTCHA = "api_captcha"
     API_MFA = "api_mfa"
     PLAYWRIGHT = "playwright"
     COOKIE_IMPORT = "cookie_import"
@@ -894,11 +840,17 @@ class EvalAuth:
     def __init__(self, api_client, cookie_manager=None):
         self.api_client = api_client
         self.cookie_manager = cookie_manager or CookieManager()
-        self.captcha_solver = CaptchaSolver()
         self._playwright = None
         self._browser = None
         self._context = None
         self._page = None
+
+        # 加载或生成fp_visitor_id
+        fp_id = self.cookie_manager.load_fp_visitor_id()
+        if not fp_id:
+            fp_id = secrets.token_hex(16)
+            self.cookie_manager.save_fp_visitor_id(fp_id)
+        self.api_client.fp_visitor_id = fp_id
 
     def login(self, username, password, strategy=LoginStrategy.AUTO, headless=True,
               cookie_import=False):
@@ -907,8 +859,6 @@ class EvalAuth:
             return self._login_auto(username, password, headless, cookie_import)
         elif strategy == LoginStrategy.COOKIE_REUSE:
             return self._login_cookie_reuse()
-        elif strategy == LoginStrategy.API_CAPTCHA:
-            return self._login_api_captcha(username, password)
         elif strategy == LoginStrategy.API_MFA:
             return self._login_api_mfa(username, password)
         elif strategy == LoginStrategy.PLAYWRIGHT:
@@ -919,7 +869,7 @@ class EvalAuth:
             raise EvalAuthError(f"未知的登录策略: {strategy}")
 
     def _login_auto(self, username, password, headless, cookie_import):
-        """AUTO策略：按顺序尝试 Cookie复用 → API+验证码 → API+MFA → Playwright"""
+        """AUTO策略：按顺序尝试 Cookie复用 → Chrome导入 → API登录 → Playwright"""
         # 1. Cookie复用
         print("    [AUTO] 尝试Cookie复用...")
         try:
@@ -941,28 +891,17 @@ class EvalAuth:
             except (EvalAuthError, EvalTokenExpiredError):
                 pass
 
-        # 3. API+验证码
-        if _HAS_DDDDOCR:
-            print("    [AUTO] 尝试API+验证码登录...")
-            try:
-                result = self._login_api_captcha(username, password)
-                if result:
-                    print("    [✓] API+验证码登录成功")
-                    return result
-            except EvalAuthError as e:
-                print(f"    [!] API+验证码登录失败: {e}")
-
-        # 4. API+MFA
-        print("    [AUTO] 尝试API+MFA登录...")
+        # 3. API登录（自动处理MFA）
+        print("    [AUTO] 尝试API登录...")
         try:
             result = self._login_api_mfa(username, password)
             if result:
-                print("    [✓] API+MFA登录成功")
+                print("    [✓] API登录成功")
                 return result
         except EvalAuthError as e:
-            print(f"    [!] API+MFA登录失败: {e}")
+            print(f"    [!] API登录失败: {e}")
 
-        # 5. Playwright
+        # 4. Playwright
         if _HAS_PLAYWRIGHT:
             print("    [AUTO] 尝试Playwright登录...")
             try:
@@ -1008,105 +947,12 @@ class EvalAuth:
             print(f"    [!] Cookie导入后SSO跳转失败: {e}")
         return None
 
-    def _login_api_captcha(self, username, password):
-        """CAS SSO登录（带验证码）"""
-        return self._cas_sso_login_with_captcha(username, password)
-
     def _login_api_mfa(self, username, password):
-        """CAS SSO登录（带MFA）"""
+        """CAS SSO登录（自动处理MFA）"""
         return self._cas_sso_login_with_mfa(username, password)
 
-    def _cas_sso_login_with_captcha(self, username, password):
-        """CAS SSO登录 - 验证码模式"""
-        session = self.api_client.session
-
-        # 1. 获取登录页面
-        login_url = f"{CAS_LOGIN_URL}?service={CAS_SERVICE_URL}"
-        try:
-            resp = session.get(login_url, timeout=30)
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            raise EvalNetworkError(f"访问CAS登录页失败: {e}")
-
-        soup = BeautifulSoup(resp.text, 'html.parser')
-
-        # 2. 解析表单参数
-        execution = ""
-        fail_n = 0
-        input_execution = soup.find('input', {'name': 'execution'})
-        if input_execution:
-            execution = input_execution.get('value', '')
-        input_failn = soup.find('input', {'name': 'failN'})
-        if input_failn:
-            try:
-                fail_n = int(input_failn.get('value', '0'))
-            except ValueError:
-                fail_n = 0
-
-        # 3. 检查是否需要验证码
-        has_captcha = bool(soup.find('input', {'name': 'captcha'})) or bool(soup.find('img', {'src': re.compile(r'captcha')}))
-        captcha_value = ""
-        if has_captcha and _HAS_DDDDOCR:
-            captcha_value = self.captcha_solver.solve_captcha(session) or ""
-        elif has_captcha and not _HAS_DDDDOCR:
-            print("    [!] 需要验证码但ddddocr未安装")
-
-        # 4. 加密密码
-        encrypted_pwd = self._encrypt_password(password)
-
-        # 5. 提交登录
-        form_data = {
-            "username": username,
-            "password": encrypted_pwd,
-            "captcha": captcha_value,
-            "currentMenu": "1",
-            "failN": str(fail_n),
-            "mfaState": "",
-            "execution": execution,
-            "_eventId": "submit",
-            "geolocation": "",
-            "fpVisitorId": self.api_client._generate_client_id(),
-            "trustAgent": "",
-            "submit1": "Login1",
-        }
-        form_headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Origin": CAS_BASE,
-            "Referer": f"{CAS_LOGIN_URL}?service={quote(CAS_SERVICE_URL)}",
-        }
-
-        try:
-            resp = session.post(
-                f"{CAS_LOGIN_URL}?service={CAS_SERVICE_URL}",
-                data=form_data,
-                headers=form_headers,
-                allow_redirects=False,
-                timeout=30,
-            )
-        except requests.RequestException as e:
-            raise EvalNetworkError(f"提交CAS登录表单失败: {e}")
-
-        # 6. 处理响应
-        if resp.status_code in (301, 302, 303, 307, 308):
-            return self._follow_deal_sso(resp)
-
-        # 200 = 可能需要MFA验证
-        if resp.status_code == 200:
-            page_text = resp.text
-            mfa_needed = (
-                "mfaState" in page_text
-                or "安全验证" in page_text
-                or "mfaEnabled" in page_text
-                or "appPushStatusAlertMessage" in page_text
-            )
-            if mfa_needed:
-                print("    验证码验证通过，需要进行MFA安全验证...")
-                return self._handle_mfa_after_login(username, encrypted_pwd, page_text)
-
-        raise EvalAuthError("CAS登录失败，请检查账号密码或验证码")
-
     def _handle_mfa_after_login(self, username, encrypted_pwd, page_text, execution=""):
-        """MFA安全验证流程（验证码通过后或MFA模式共用）"""
+        """MFA安全验证流程"""
         session = self.api_client.session
         login_url = f"{CAS_LOGIN_URL}?service={CAS_SERVICE_URL}"
 
@@ -1114,7 +960,7 @@ class EvalAuth:
             # Step 1: detect MFA
             detect_resp = session.post(
                 f"{CAS_BASE}/mfa/detect",
-                data={"username": username, "password": encrypted_pwd},
+                data={"username": username, "password": encrypted_pwd, "fpVisitorId": self.api_client.fp_visitor_id},
                 timeout=15,
             )
             detect_data = {}
@@ -1122,9 +968,65 @@ class EvalAuth:
                 detect_data = detect_resp.json()
             except Exception:
                 pass
+
+            # 检查是否需要MFA
+            mfa_data = detect_data.get("data", {})
+            mfa_needed = mfa_data.get("need", True)
+
+            if not mfa_needed:
+                # 设备已信任，不需要MFA，提交带mfaState的登录表单
+                print("    [MFA] 当前设备已信任，跳过安全验证")
+                trusted_mfa_state = mfa_data.get("state", "")
+                # 重新获取execution（可能已过期）
+                new_execution = execution
+                try:
+                    resp2 = session.get(login_url, timeout=30)
+                    soup2 = BeautifulSoup(resp2.text, 'html.parser')
+                    exec_input = soup2.find('input', {'name': 'execution'})
+                    if exec_input:
+                        new_execution = exec_input.get('value', execution)
+                except Exception:
+                    pass
+                form_data = {
+                    "username": username,
+                    "password": encrypted_pwd,
+                    "captcha": "",
+                    "currentMenu": "1",
+                    "failN": "-1",
+                    "mfaState": trusted_mfa_state,
+                    "execution": new_execution,
+                    "_eventId": "submit",
+                    "geolocation": "",
+                    "fpVisitorId": self.api_client.fp_visitor_id,
+                    "trustAgent": "",
+                    "submit1": "Login1",
+                }
+                form_headers = {
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Origin": CAS_BASE,
+                    "Referer": f"{CAS_LOGIN_URL}?service={quote(CAS_SERVICE_URL)}",
+                    "sec-fetch-dest": "document",
+                    "sec-fetch-mode": "navigate",
+                    "sec-fetch-site": "same-origin",
+                    "sec-fetch-user": "?1",
+                    "upgrade-insecure-requests": "1",
+                }
+                resp = session.post(
+                    f"{CAS_LOGIN_URL}?service={CAS_SERVICE_URL}",
+                    data=form_data,
+                    headers=form_headers,
+                    allow_redirects=False,
+                    timeout=30,
+                )
+                if resp.status_code in (301, 302, 303, 307, 308):
+                    location = resp.headers.get("Location", "")
+                    if "ticket=" in location:
+                        return self._follow_deal_sso(resp)
+                # 如果没成功跳转，打印调试信息并继续正常MFA流程
+                print(f"    [MFA] 信任设备跳过失败(状态:{resp.status_code})，继续安全验证流程...")
+
             mfa_state = ""
             if detect_data.get("code") == 0 or detect_data.get("status") == 200:
-                mfa_data = detect_data.get("data", {})
                 mfa_state = mfa_data.get("state", "")
 
             if not mfa_state:
@@ -1199,6 +1101,12 @@ class EvalAuth:
 
             print("    [MFA] 短信验证成功！")
 
+            # 询问是否设为可信客户端
+            trust_choice = input("    是否将当前设备设为可信客户端？后续登录可跳过安全验证 (y/n): ").strip().lower()
+            trust_agent = "true" if trust_choice == "y" else ""
+            if trust_agent:
+                print("    [✓] 已设为可信客户端")
+
             # Step 6: 重新获取CAS登录页面（刷新execution）
             new_execution = execution
             try:
@@ -1222,14 +1130,19 @@ class EvalAuth:
                 "execution": new_execution,
                 "_eventId": "submit",
                 "geolocation": "",
-                "fpVisitorId": self.api_client._generate_client_id(),
-                "trustAgent": "",
+                "fpVisitorId": self.api_client.fp_visitor_id,
+                "trustAgent": trust_agent,
                 "submit1": "Login1",
             }
             mfa_headers = {
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Origin": CAS_BASE,
                 "Referer": f"{CAS_LOGIN_URL}?service={quote(CAS_SERVICE_URL)}",
+                "sec-fetch-dest": "document",
+                "sec-fetch-mode": "navigate",
+                "sec-fetch-site": "same-origin",
+                "sec-fetch-user": "?1",
+                "upgrade-insecure-requests": "1",
             }
             try:
                 resp = session.post(
@@ -1258,13 +1171,25 @@ class EvalAuth:
         return self._follow_deal_sso(resp)
 
     def _cas_sso_login_with_mfa(self, username, password):
-        """CAS SSO登录 - MFA模式（完整API流程）"""
+        """CAS SSO登录 - 自动处理MFA"""
         session = self.api_client.session
+
+        # 0. 加载之前保存的CAS Cookie（TGC、CAS_MFA_TRUSTED等）
+        # 这样CAS可以识别已认证的session或可信设备
+        self.cookie_manager.load_cookies(session, domain_filter="cas.s.zzu.edu.cn")
 
         # 1. 获取登录页面
         login_url = f"{CAS_LOGIN_URL}?service={CAS_SERVICE_URL}"
         try:
-            resp = session.get(login_url, timeout=30)
+            resp = session.get(login_url, timeout=30, allow_redirects=False)
+            # 如果TGC有效，CAS会直接302到service URL
+            if resp.status_code in (301, 302, 303, 307, 308):
+                location = resp.headers.get("Location", "")
+                if "ticket=" in location:
+                    print("    [CAS] TGC有效，跳过登录直接签发ticket")
+                    return self._follow_deal_sso(resp)
+                # 跟随重定向
+                resp = session.get(location, timeout=30)
             resp.raise_for_status()
         except requests.RequestException as e:
             raise EvalNetworkError(f"访问CAS登录页失败: {e}")
@@ -1286,12 +1211,12 @@ class EvalAuth:
             "password": encrypted_pwd,
             "captcha": "",
             "currentMenu": "1",
-            "failN": "0",
+            "failN": "-1",
             "mfaState": "",
             "execution": execution,
             "_eventId": "submit",
             "geolocation": "",
-            "fpVisitorId": "ae6ce9e6d1e14c1abc4609143ce4e1ae",
+            "fpVisitorId": self.api_client.fp_visitor_id,
             "trustAgent": "",
             "submit1": "Login1",
         }
@@ -1299,6 +1224,11 @@ class EvalAuth:
             "Content-Type": "application/x-www-form-urlencoded",
             "Origin": CAS_BASE,
             "Referer": f"{CAS_LOGIN_URL}?service={quote(CAS_SERVICE_URL)}",
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-site": "same-origin",
+            "sec-fetch-user": "?1",
+            "upgrade-insecure-requests": "1",
         }
 
         try:
@@ -1318,7 +1248,7 @@ class EvalAuth:
             if "ticket=" in location:
                 return self._follow_deal_sso(resp)
 
-        # 5. 检测MFA - 使用API方式
+        # 检测MFA
         if resp.status_code == 200:
             page_text = resp.text
             mfa_needed = (
@@ -1328,15 +1258,12 @@ class EvalAuth:
                 or "appPushStatusAlertMessage" in page_text
             )
 
-            if not mfa_needed:
-                has_captcha = "captcha" in page_text.lower()
-                if has_captcha:
-                    raise EvalAuthError("CAS登录需要验证码，请使用 --strategy api_captcha 策略")
-                raise EvalAuthError("CAS登录失败，可能账号密码错误")
+            if mfa_needed:
+                return self._handle_mfa_after_login(username, encrypted_pwd, page_text, execution)
 
-            return self._handle_mfa_after_login(username, encrypted_pwd, page_text, execution)
+            raise EvalAuthError("CAS登录失败，可能账号密码错误")
 
-        # 6. 处理重定向获取token
+        # 5. 处理重定向获取token
         return self._follow_deal_sso(resp)
 
     def _encrypt_password(self, password):
@@ -1431,6 +1358,8 @@ class EvalAuth:
                     )
                     # 保存Cookie
                     self.cookie_manager.save_cookies(self.api_client.session)
+                    if hasattr(self.api_client, 'fp_visitor_id') and self.api_client.fp_visitor_id:
+                        self.cookie_manager.save_fp_visitor_id(self.api_client.fp_visitor_id)
                     return token, user_info
         except (EvalAPIError, EvalTokenExpiredError, EvalNetworkError) as e:
             print(f"    [!] 获取用户上下文失败: {e}")
@@ -2225,56 +2154,6 @@ class ZZUAutoEvaluate:
         """检查Playwright是否可用"""
         return _HAS_PLAYWRIGHT and not self.api_only
 
-    def _playwright_fallback(self, tasks, whitelist=None, blacklist=None):
-        """Playwright回退模式 - 对失败的任务使用浏览器填写"""
-        if not self._ensure_playwright():
-            return None
-
-        success_count = 0
-        fail_count = 0
-
-        for task_index, task in enumerate(tasks):
-            task_id = task.get("TaskId")
-            questionnaire_id = task.get("QuestionnaireId")
-            q_name = task.get("QuestionnaireName", "未知")
-
-            print(f"\n    [Playwright回退] 处理: {q_name}")
-
-            try:
-                # 导航到任务详情
-                self._navigate_to_task_details(task, task_index)
-
-                # 获取课程列表
-                courses = self._get_course_list_from_details()
-                if not courses:
-                    continue
-
-                # 过滤
-                filtered = self.filter_teachers(courses, whitelist, blacklist)
-                eval_courses = [c for c in filtered if c.get("canEvaluate", False)]
-
-                for course_info in eval_courses:
-                    course_name = course_info.get("courseName", "未知")
-                    teacher_name = course_info.get("teacherName", "未知")
-                    print(f"      评价: {course_name} - {teacher_name}")
-
-                    try:
-                        ok, msg = self.evaluate_single_course(task, task_index, course_name, teacher_name)
-                        if ok:
-                            success_count += 1
-                        else:
-                            fail_count += 1
-                    except Exception as e:
-                        print(f"      [✗] 异常: {e}")
-                        fail_count += 1
-
-                    time.sleep(random.uniform(1.0, 2.5))
-            except Exception as e:
-                print(f"    [✗] Playwright回退失败: {e}")
-                fail_count += 1
-
-        return success_count, fail_count
-
     def _playwright_full_evaluate(self, tasks, whitelist=None, blacklist=None):
         """完全使用Playwright进行评价"""
         if not self._ensure_playwright():
@@ -2685,7 +2564,7 @@ if __name__ == "__main__":
     parser.add_argument("-u", "--username", required=True, help="学号")
     parser.add_argument("-p", "--password", default="", help="密码（Cookie复用/导入时可选）")
     parser.add_argument("--strategy", default="auto",
-                        choices=["auto", "cookie_reuse", "api_captcha", "api_mfa", "playwright", "cookie_import"],
+                        choices=["auto", "cookie_reuse", "api_mfa", "playwright", "cookie_import"],
                         help="登录策略 (默认: auto)")
     parser.add_argument("--cookie-import", action="store_true", help="启用Chrome Cookie导入")
     parser.add_argument("--whitelist", nargs="*", help="教师白名单（仅评价这些教师的课程）")
@@ -2697,7 +2576,6 @@ if __name__ == "__main__":
     strategy_map = {
         "auto": LoginStrategy.AUTO,
         "cookie_reuse": LoginStrategy.COOKIE_REUSE,
-        "api_captcha": LoginStrategy.API_CAPTCHA,
         "api_mfa": LoginStrategy.API_MFA,
         "playwright": LoginStrategy.PLAYWRIGHT,
         "cookie_import": LoginStrategy.COOKIE_IMPORT,
