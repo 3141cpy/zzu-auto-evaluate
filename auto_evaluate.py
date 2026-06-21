@@ -641,32 +641,22 @@ class CaptchaSolver:
         return max(results, key=len)
 
     def solve_captcha(self, session, base_url=CAS_BASE, max_retries=3):
-        """下载并识别验证码，多策略融合+重试"""
-        from collections import Counter
-
-        all_results = []
+        """下载并识别验证码，多策略预处理融合+重试
+        
+        注意：CAS每次下载验证码会使前一个失效，所以每次只下载一张，
+        用多策略预处理融合提高单次识别率。只有识别失败才重新下载。
+        """
         for attempt in range(max_retries):
             try:
                 image_bytes = self.download_captcha(session, base_url)
                 code = self.solve(image_bytes)
                 if code and len(code) >= self.CAPTCHA_LEN:
-                    all_results.append(code)
-                    # 继续尝试，积累更多结果做投票
-                else:
-                    print(f"    [!] 验证码识别结果过短: '{code}'，重试 {attempt + 1}/{max_retries}")
+                    return code
+                print(f"    [!] 验证码识别结果过短: '{code}'，重试 {attempt + 1}/{max_retries}")
             except EvalError:
                 raise
             except Exception as e:
                 print(f"    [!] 验证码处理失败: {e}，重试 {attempt + 1}/{max_retries}")
-
-        # 从所有4字符结果中投票
-        len4 = [r for r in all_results if len(r) >= self.CAPTCHA_LEN]
-        if len4:
-            return Counter(len4).most_common(1)[0][0]
-
-        # 没有4字符结果
-        if all_results:
-            return all_results[-1]
         return None
 
 
@@ -1058,6 +1048,8 @@ class EvalAuth:
         captcha_value = ""
         if has_captcha and _HAS_DDDDOCR:
             captcha_value = self.captcha_solver.solve_captcha(session) or ""
+        elif has_captcha and not _HAS_DDDDOCR:
+            print("    [!] 需要验证码但ddddocr未安装")
 
         # 4. 加密密码
         encrypted_pwd = self._encrypt_password(password)
@@ -1066,25 +1058,203 @@ class EvalAuth:
         form_data = {
             "username": username,
             "password": encrypted_pwd,
-            "execution": execution,
+            "captcha": captcha_value,
+            "currentMenu": "1",
             "failN": str(fail_n),
+            "mfaState": "",
+            "execution": execution,
             "_eventId": "submit",
             "geolocation": "",
+            "fpVisitorId": self.api_client._generate_client_id(),
+            "trustAgent": "",
+            "submit1": "Login1",
         }
-        if captcha_value:
-            form_data["captcha"] = captcha_value
+        form_headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": CAS_BASE,
+            "Referer": f"{CAS_LOGIN_URL}?service={quote(CAS_SERVICE_URL)}",
+        }
 
         try:
             resp = session.post(
                 f"{CAS_LOGIN_URL}?service={CAS_SERVICE_URL}",
                 data=form_data,
+                headers=form_headers,
                 allow_redirects=False,
                 timeout=30,
             )
         except requests.RequestException as e:
             raise EvalNetworkError(f"提交CAS登录表单失败: {e}")
 
-        # 6. 处理重定向获取token
+        # 6. 处理响应
+        if resp.status_code in (301, 302, 303, 307, 308):
+            return self._follow_deal_sso(resp)
+
+        # 200 = 可能需要MFA验证
+        if resp.status_code == 200:
+            page_text = resp.text
+            mfa_needed = (
+                "mfaState" in page_text
+                or "安全验证" in page_text
+                or "mfaEnabled" in page_text
+                or "appPushStatusAlertMessage" in page_text
+            )
+            if mfa_needed:
+                print("    验证码验证通过，需要进行MFA安全验证...")
+                return self._handle_mfa_after_login(username, encrypted_pwd, page_text)
+
+        raise EvalAuthError("CAS登录失败，请检查账号密码或验证码")
+
+    def _handle_mfa_after_login(self, username, encrypted_pwd, page_text, execution=""):
+        """MFA安全验证流程（验证码通过后或MFA模式共用）"""
+        session = self.api_client.session
+        login_url = f"{CAS_LOGIN_URL}?service={CAS_SERVICE_URL}"
+
+        try:
+            # Step 1: detect MFA
+            detect_resp = session.post(
+                f"{CAS_BASE}/mfa/detect",
+                data={"username": username, "password": encrypted_pwd},
+                timeout=15,
+            )
+            detect_data = {}
+            try:
+                detect_data = detect_resp.json()
+            except Exception:
+                pass
+            mfa_state = ""
+            if detect_data.get("code") == 0 or detect_data.get("status") == 200:
+                mfa_data = detect_data.get("data", {})
+                mfa_state = mfa_data.get("state", "")
+
+            if not mfa_state:
+                mfa_state_patterns = [
+                    r'mfaState\s*:\s*"([A-Za-z0-9]+)"',
+                    r'mfaState\s*=\s*"([A-Za-z0-9]+)"',
+                    r'"mfaState"\s*:\s*"([A-Za-z0-9]+)"',
+                    r"name='mfaState'\s+value='([A-Za-z0-9]+)'",
+                ]
+                for pattern in mfa_state_patterns:
+                    match = re.search(pattern, page_text)
+                    if match:
+                        mfa_state = match.group(1)
+                        break
+
+            if not mfa_state:
+                raise EvalAuthError("无法获取MFA状态")
+
+            # Step 2: initByType securephone
+            init_resp = session.get(
+                f"{CAS_BASE}/mfa/initByType/securephone",
+                params={"state": mfa_state},
+                timeout=15,
+            )
+            init_data = {}
+            try:
+                init_data = init_resp.json()
+            except Exception:
+                pass
+            mfa_info = init_data.get("data", {})
+            attest_server_url = mfa_info.get("attestServerUrl", "")
+            gid = mfa_info.get("gid", "")
+            secure_phone = mfa_info.get("securePhone", mfa_info.get("phone", ""))
+
+            if secure_phone:
+                print(f"    [MFA] 安全手机: {secure_phone[:3]}****{secure_phone[-4:]}")
+
+            # Step 3: 发送短信验证码
+            if attest_server_url and gid:
+                send_resp = session.post(
+                    f"{attest_server_url}/api/guard/securephone/send",
+                    json={"gid": gid},
+                    timeout=15,
+                )
+                print("    [MFA] 短信验证码已发送")
+            else:
+                print("    [MFA] 尝试发送短信验证码...")
+                try:
+                    session.get(
+                        f"{CAS_BASE}/mfa/initByType/securephone",
+                        params={"state": mfa_state},
+                        timeout=15,
+                    )
+                except Exception:
+                    pass
+
+            # Step 4: 用户输入验证码
+            sms_code = input("    请输入收到的短信验证码: ").strip()
+            if not sms_code:
+                raise EvalAuthError("未输入短信验证码")
+
+            # Step 5: 验证短信验证码
+            if attest_server_url and gid:
+                valid_resp = session.post(
+                    f"{attest_server_url}/api/guard/securephone/valid",
+                    json={"gid": gid, "code": sms_code},
+                    timeout=15,
+                )
+                valid_data = valid_resp.json() if valid_resp.status_code == 200 else {}
+                if valid_data.get("data", {}).get("status") != 2:
+                    raise EvalAuthError("短信验证码验证失败")
+
+            print("    [MFA] 短信验证成功！")
+
+            # Step 6: 重新获取CAS登录页面（刷新execution）
+            new_execution = execution
+            try:
+                resp = session.get(login_url, timeout=30)
+                soup = BeautifulSoup(resp.text, 'html.parser')
+                execution_input = soup.find('input', {'name': 'execution'})
+                if execution_input:
+                    new_execution = execution_input.get('value', execution)
+            except Exception:
+                pass
+
+            # Step 7: 提交带MFA的登录表单
+            mfa_form_data = {
+                "username": username,
+                "password": encrypted_pwd,
+                "captcha": "",
+                "currentMenu": "1",
+                "failN": "-1",
+                "mfaState": mfa_state,
+                "code": sms_code,
+                "execution": new_execution,
+                "_eventId": "submit",
+                "geolocation": "",
+                "fpVisitorId": self.api_client._generate_client_id(),
+                "trustAgent": "",
+                "submit1": "Login1",
+            }
+            mfa_headers = {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": CAS_BASE,
+                "Referer": f"{CAS_LOGIN_URL}?service={quote(CAS_SERVICE_URL)}",
+            }
+            try:
+                resp = session.post(
+                    f"{CAS_LOGIN_URL}?service={CAS_SERVICE_URL}",
+                    data=mfa_form_data,
+                    headers=mfa_headers,
+                    allow_redirects=False,
+                    timeout=30,
+                )
+            except requests.RequestException as e:
+                raise EvalNetworkError(f"提交MFA验证失败: {e}")
+
+            # 检查是否302重定向含ticket
+            if resp.status_code in (301, 302, 303, 307, 308):
+                location = resp.headers.get("Location", "")
+                if "ticket=" in location:
+                    return self._follow_deal_sso(resp)
+
+        except EvalAuthError:
+            raise
+        except EvalNetworkError:
+            raise
+        except Exception as e:
+            raise EvalAuthError(f"MFA验证流程失败: {e}")
+
         return self._follow_deal_sso(resp)
 
     def _cas_sso_login_with_mfa(self, username, password):
@@ -1164,150 +1334,7 @@ class EvalAuth:
                     raise EvalAuthError("CAS登录需要验证码，请使用 --strategy api_captcha 策略")
                 raise EvalAuthError("CAS登录失败，可能账号密码错误")
 
-            try:
-                # Step 1: detect MFA (需要username和password参数)
-                detect_resp = session.post(
-                    f"{CAS_BASE}/mfa/detect",
-                    data={"username": username, "password": encrypted_pwd},
-                    timeout=15,
-                )
-                detect_data = {}
-                try:
-                    detect_data = detect_resp.json()
-                except Exception:
-                    pass
-                mfa_state = ""
-                if detect_data.get("code") == 0 or detect_data.get("status") == 200:
-                    mfa_data = detect_data.get("data", {})
-                    mfa_state = mfa_data.get("state", "")
-
-                if not mfa_state:
-                    mfa_state_patterns = [
-                        r'mfaState\s*:\s*"([A-Za-z0-9]+)"',
-                        r'mfaState\s*=\s*"([A-Za-z0-9]+)"',
-                        r'"mfaState"\s*:\s*"([A-Za-z0-9]+)"',
-                        r"name='mfaState'\s+value='([A-Za-z0-9]+)'",
-                    ]
-                    for pattern in mfa_state_patterns:
-                        match = re.search(pattern, page_text)
-                        if match:
-                            mfa_state = match.group(1)
-                            break
-
-                if not mfa_state:
-                    raise EvalAuthError("无法获取MFA状态")
-
-                # Step 2: initByType securephone
-                init_resp = session.get(
-                    f"{CAS_BASE}/mfa/initByType/securephone",
-                    params={"state": mfa_state},
-                    timeout=15,
-                )
-                init_data = {}
-                try:
-                    init_data = init_resp.json()
-                except Exception:
-                    pass
-                mfa_info = init_data.get("data", {})
-                attest_server_url = mfa_info.get("attestServerUrl", "")
-                gid = mfa_info.get("gid", "")
-                secure_phone = mfa_info.get("securePhone", mfa_info.get("phone", ""))
-
-                if secure_phone:
-                    print(f"    [MFA] 安全手机: {secure_phone[:3]}****{secure_phone[-4:]}")
-
-                # Step 3: 发送短信验证码
-                if attest_server_url and gid:
-                    send_resp = session.post(
-                        f"{attest_server_url}/api/guard/securephone/send",
-                        json={"gid": gid},
-                        timeout=15,
-                    )
-                    print("    [MFA] 短信验证码已发送")
-                else:
-                    print("    [MFA] 尝试发送短信验证码...")
-                    try:
-                        session.get(
-                            f"{CAS_BASE}/mfa/initByType/securephone",
-                            params={"state": mfa_state},
-                            timeout=15,
-                        )
-                    except Exception:
-                        pass
-
-                # Step 4: 用户输入验证码
-                sms_code = input("    请输入收到的短信验证码: ").strip()
-                if not sms_code:
-                    raise EvalAuthError("未输入短信验证码")
-
-                # Step 5: 验证短信验证码
-                if attest_server_url and gid:
-                    valid_resp = session.post(
-                        f"{attest_server_url}/api/guard/securephone/valid",
-                        json={"gid": gid, "code": sms_code},
-                        timeout=15,
-                    )
-                    valid_data = valid_resp.json() if valid_resp.status_code == 200 else {}
-                    if valid_data.get("data", {}).get("status") != 2:
-                        raise EvalAuthError("短信验证码验证失败")
-
-                print("    [MFA] 短信验证成功！")
-
-                # Step 6: 重新获取CAS登录页面（刷新execution）
-                new_execution = execution
-                try:
-                    resp = session.get(login_url, timeout=30)
-                    soup = BeautifulSoup(resp.text, 'html.parser')
-                    execution_input = soup.find('input', {'name': 'execution'})
-                    if execution_input:
-                        new_execution = execution_input.get('value', execution)
-                except Exception:
-                    pass
-
-                # Step 7: 提交带MFA的登录表单（包含完整字段）
-                mfa_data = {
-                    "username": username,
-                    "password": encrypted_pwd,
-                    "captcha": "",
-                    "currentMenu": "1",
-                    "failN": "-1",
-                    "mfaState": mfa_state,
-                    "code": sms_code,
-                    "execution": new_execution,
-                    "_eventId": "submit",
-                    "geolocation": "",
-                    "fpVisitorId": "ae6ce9e6d1e14c1abc4609143ce4e1ae",
-                    "trustAgent": "",
-                    "submit1": "Login1",
-                }
-                mfa_headers = {
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Origin": CAS_BASE,
-                    "Referer": f"{CAS_LOGIN_URL}?service={quote(CAS_SERVICE_URL)}",
-                }
-                try:
-                    resp = session.post(
-                        f"{CAS_LOGIN_URL}?service={CAS_SERVICE_URL}",
-                        data=mfa_data,
-                        headers=mfa_headers,
-                        allow_redirects=False,
-                        timeout=30,
-                    )
-                except requests.RequestException as e:
-                    raise EvalNetworkError(f"提交MFA验证失败: {e}")
-
-                # 检查是否302重定向含ticket
-                if resp.status_code in (301, 302, 303, 307, 308):
-                    location = resp.headers.get("Location", "")
-                    if "ticket=" in location:
-                        return self._follow_deal_sso(resp)
-
-            except EvalAuthError:
-                raise
-            except EvalNetworkError:
-                raise
-            except Exception as e:
-                raise EvalAuthError(f"MFA验证流程失败: {e}")
+            return self._handle_mfa_after_login(username, encrypted_pwd, page_text, execution)
 
         # 6. 处理重定向获取token
         return self._follow_deal_sso(resp)
@@ -1370,7 +1397,16 @@ class EvalAuth:
 
         # 如果重定向到了CAS登录页，说明登录失败
         if "cas.s.zzu.edu.cn/cas/a/login" in final_url:
-            raise EvalAuthError("CAS登录失败，请检查账号密码")
+            # 尝试提取CAS错误信息
+            error_msg = "CAS登录失败，请检查账号密码"
+            try:
+                soup = BeautifulSoup(resp.text, 'html.parser')
+                err_el = soup.find('div', {'id': 'msg'}) or soup.find('span', {'class': 'error'}) or soup.find('div', {'class': 'alert-danger'})
+                if err_el and err_el.get_text(strip=True):
+                    error_msg = f"CAS登录失败: {err_el.get_text(strip=True)}"
+            except Exception:
+                pass
+            raise EvalAuthError(error_msg)
 
         raise EvalAuthError(f"未能从SSO跳转中提取token，最终URL: {final_url[:200]}")
 
