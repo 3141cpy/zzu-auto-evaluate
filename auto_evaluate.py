@@ -24,7 +24,6 @@ from bs4 import BeautifulSoup
 # ─── 可选依赖 ───────────────────────────────────────────────
 try:
     from Crypto.Cipher import AES
-    from Crypto.Util.Padding import pad, unpad
     import base64
     _HAS_PYCRYPTODOME = True
 except ImportError:
@@ -845,10 +844,10 @@ class EvalAuth:
         self._context = None
         self._page = None
 
-        # 加载或生成fp_visitor_id
+        # 加载或使用默认fp_visitor_id
         fp_id = self.cookie_manager.load_fp_visitor_id()
         if not fp_id:
-            fp_id = secrets.token_hex(16)
+            fp_id = "00000000000000000000000000000000"
             self.cookie_manager.save_fp_visitor_id(fp_id)
         self.api_client.fp_visitor_id = fp_id
 
@@ -977,16 +976,8 @@ class EvalAuth:
                 # 设备已信任，不需要MFA，提交带mfaState的登录表单
                 print("    [MFA] 当前设备已信任，跳过安全验证")
                 trusted_mfa_state = mfa_data.get("state", "")
-                # 重新获取execution（可能已过期）
-                new_execution = execution
-                try:
-                    resp2 = session.get(login_url, timeout=30)
-                    soup2 = BeautifulSoup(resp2.text, 'html.parser')
-                    exec_input = soup2.find('input', {'name': 'execution'})
-                    if exec_input:
-                        new_execution = exec_input.get('value', execution)
-                except Exception:
-                    pass
+                # 从MFA页面提取execution（不要重新GET登录页，会破坏session）
+                page_execution = self._extract_execution_from_page(page_text) or execution
                 form_data = {
                     "username": username,
                     "password": encrypted_pwd,
@@ -994,11 +985,11 @@ class EvalAuth:
                     "currentMenu": "1",
                     "failN": "-1",
                     "mfaState": trusted_mfa_state,
-                    "execution": new_execution,
+                    "execution": page_execution,
                     "_eventId": "submit",
                     "geolocation": "",
                     "fpVisitorId": self.api_client.fp_visitor_id,
-                    "trustAgent": "",
+                    "trustAgent": "true",
                     "submit1": "Login1",
                 }
                 form_headers = {
@@ -1073,15 +1064,7 @@ class EvalAuth:
                 )
                 print("    [MFA] 短信验证码已发送")
             else:
-                print("    [MFA] 尝试发送短信验证码...")
-                try:
-                    session.get(
-                        f"{CAS_BASE}/mfa/initByType/securephone",
-                        params={"state": mfa_state},
-                        timeout=15,
-                    )
-                except Exception:
-                    pass
+                raise EvalAuthError("无法获取短信验证服务信息，请稍后重试")
 
             # Step 4: 用户输入验证码
             sms_code = input("    请输入收到的短信验证码: ").strip()
@@ -1097,9 +1080,8 @@ class EvalAuth:
                 )
                 valid_data = valid_resp.json() if valid_resp.status_code == 200 else {}
                 if valid_data.get("data", {}).get("status") != 2:
-                    raise EvalAuthError("短信验证码验证失败")
-
-            print("    [MFA] 短信验证成功！")
+                    raise EvalAuthError("短信验证码错误，请检查后重试")
+                print("    [MFA] 短信验证码校验通过")
 
             # 询问是否设为可信客户端
             trust_choice = input("    是否将当前设备设为可信客户端？后续登录可跳过安全验证 (y/n): ").strip().lower()
@@ -1107,16 +1089,8 @@ class EvalAuth:
             if trust_agent:
                 print("    [✓] 已设为可信客户端")
 
-            # Step 6: 重新获取CAS登录页面（刷新execution）
-            new_execution = execution
-            try:
-                resp = session.get(login_url, timeout=30)
-                soup = BeautifulSoup(resp.text, 'html.parser')
-                execution_input = soup.find('input', {'name': 'execution'})
-                if execution_input:
-                    new_execution = execution_input.get('value', execution)
-            except Exception:
-                pass
+            # Step 6: 从MFA页面提取execution（不要重新GET登录页，会破坏session）
+            mfa_execution = self._extract_execution_from_page(page_text) or execution
 
             # Step 7: 提交带MFA的登录表单
             mfa_form_data = {
@@ -1127,7 +1101,7 @@ class EvalAuth:
                 "failN": "-1",
                 "mfaState": mfa_state,
                 "code": sms_code,
-                "execution": new_execution,
+                "execution": mfa_execution,
                 "_eventId": "submit",
                 "geolocation": "",
                 "fpVisitorId": self.api_client.fp_visitor_id,
@@ -1159,7 +1133,25 @@ class EvalAuth:
             if resp.status_code in (301, 302, 303, 307, 308):
                 location = resp.headers.get("Location", "")
                 if "ticket=" in location:
+                    print("    [MFA] 短信验证成功！")
                     return self._follow_deal_sso(resp)
+                # 302但不含ticket，可能是账号密码错误
+                if "/cas/a/login" in location:
+                    raise EvalAuthError("账号或密码错误")
+                raise EvalAuthError(f"MFA验证后登录失败，重定向到: {location}")
+
+            # 200响应 - MFA验证码可能过期或不匹配
+            if resp.status_code == 200:
+                page_text = resp.text
+                # 检查是否仍停留在MFA页面（验证码不匹配）
+                if "mfaState" in page_text or "安全验证" in page_text:
+                    raise EvalAuthError("短信验证码不匹配或已过期，请重试")
+                # 检查是否有账号密码错误提示
+                soup = BeautifulSoup(page_text, 'html.parser')
+                err_el = soup.find('div', {'id': 'msg'}) or soup.find('span', {'class': 'error'}) or soup.find('div', {'class': 'alert-danger'})
+                if err_el and err_el.get_text(strip=True):
+                    raise EvalAuthError(f"账号或密码错误: {err_el.get_text(strip=True)}")
+                raise EvalAuthError("MFA验证后登录失败，请检查账号密码是否正确")
 
         except EvalAuthError:
             raise
@@ -1261,10 +1253,35 @@ class EvalAuth:
             if mfa_needed:
                 return self._handle_mfa_after_login(username, encrypted_pwd, page_text, execution)
 
-            raise EvalAuthError("CAS登录失败，可能账号密码错误")
+            raise EvalAuthError("账号或密码错误")
 
         # 5. 处理重定向获取token
         return self._follow_deal_sso(resp)
+
+    @staticmethod
+    def _extract_execution_from_page(page_text):
+        """从MFA页面HTML中提取execution参数"""
+        try:
+            soup = BeautifulSoup(page_text, 'html.parser')
+            exec_input = soup.find('input', {'name': 'execution'})
+            if exec_input:
+                value = exec_input.get('value', '')
+                if value:
+                    return value
+        except Exception:
+            pass
+
+        patterns = [
+            r'name="execution"\s+value="([^"]+)"',
+            r"value='([^']+)'\s+name='execution'",
+            r'name="execution"\s+value=\'([^\']+)\'',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, page_text)
+            if match:
+                return match.group(1)
+
+        return None
 
     def _encrypt_password(self, password):
         """RSA加密密码"""

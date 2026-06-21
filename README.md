@@ -2,12 +2,16 @@
 
 郑州大学本科教学质量管理平台（jxpj）自动评价工具，一键完成所有教师评价任务。
 
+**项目仓库**：https://github.com/3141cpy/zzu-auto-evaluate
+
 ## 功能特点
 
 - **API直连模式**：直接调用评价系统API提交评价，无需浏览器自动化，速度快、稳定性高
 - **多种登录策略**：Cookie复用 → Chrome Cookie导入 → API+MFA登录 → Playwright回退
-- **可信客户端**：MFA验证时可设为可信设备，后续登录自动跳过安全验证
-- **TGC复用**：有效TGC Cookie自动跳过整个登录流程
+- **免验证码登录**：failN设为"-1"避免触发图片验证码，无需ddddocr等OCR依赖
+- **MFA自动跳过**：detect接口返回need=false时，自动以trustAgent="true"跳过MFA
+- **MFA短信验证**：完整流程 detect→initByType→send→valid→submit，支持设为可信设备
+- **TGC Cookie复用**：保存并复用TGC Cookie，后续登录直接签发ticket，跳过整个登录流程
 - **全类型覆盖**：自动识别理论课、实验课等不同问卷类型，逐一提交
 - **AuthKey加密**：RSA-1024加密生成AuthKey，确保提交合法性
 - **教师筛选**：支持白名单/黑名单模式，灵活指定评价范围
