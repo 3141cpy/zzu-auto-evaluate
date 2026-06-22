@@ -6,6 +6,8 @@
 
 - **API直连模式**：直接调用评价系统API提交评价，无需浏览器自动化，速度快、稳定性高
 - **多种登录策略**：Cookie复用 → Chrome Cookie导入 → API+MFA登录 → Playwright回退
+- **多种MFA验证方式**：支持APP扫码（qrcode）、APP推送（appPush）、短信验证码（securephone）三种MFA验证方式，自动检测可用方式并支持用户手动选择
+- **终端二维码展示**：APP扫码验证时，使用Pillow库下载二维码PNG图片并在终端直接渲染显示（Unicode方块字符双行高显示），无需手动打开图片
 - **MFA可信客户端自动跳过**：使用fpVisitorId标识设备，CAS detect接口返回need=false时自动跳过MFA验证，无需用户干预
 - **TGC复用**：有效TGC Cookie自动跳过整个登录流程
 - **全类型覆盖**：自动识别理论课、实验课等不同问卷类型，逐一提交
@@ -18,7 +20,7 @@
 ### 安装依赖
 
 ```bash
-pip install pycryptodome beautifulsoup4 requests
+pip install pycryptodome beautifulsoup4 requests Pillow
 ```
 
 如需Playwright浏览器登录（回退方案）：
@@ -97,6 +99,25 @@ python auto_evaluate.py -u 学号 -p 密码 --blacklist 王老师
 
 ```
 [1] 登录中... (策略: api_mfa)
+    [MFA] 检测到多种验证方式可用:
+    请选择验证方式 (1=APP扫码验证, 2=APP推送验证, 3=短信验证码，默认1): 1
+    [MFA] 已选择: APP扫码验证
+    [MFA] 二维码已生成，请使用APP扫描：
+    ██████████████████████████████
+    ██▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀██
+    ██▀▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▀▄██
+    ...（终端直接显示二维码）
+    [MFA] 等待APP扫码确认... (120秒超时)
+    [MFA] 扫码验证成功！
+    是否将当前设备设为可信客户端？后续登录可跳过安全验证 (y/n): y
+    [✓] 已设为可信客户端
+[✓] 登录成功！
+```
+
+### 短信验证方式
+
+```
+[1] 登录中... (策略: api_mfa)
     [MFA] 安全手机: 138****1234
     [MFA] 短信验证码已发送
     请输入收到的短信验证码: 1234
@@ -110,8 +131,8 @@ python auto_evaluate.py -u 学号 -p 密码 --blacklist 王老师
 
 ```
 [1] 登录中... (策略: api_mfa)
-    [MFA] 当前设备已信任，跳过安全验证
-[✓] 登录成功！
+    [MFA] CAS detect返回need=false，自动跳过MFA验证
+    [✓] 登录成功！
 ```
 
 ## 参数说明
@@ -123,7 +144,7 @@ python auto_evaluate.py -u 学号 -p 密码 --blacklist 王老师
 | `--strategy` | | 否 | 登录策略：auto(默认)、cookie_reuse、api_mfa、playwright、cookie_import |
 | `--cookie-import` | | 否 | 启用Chrome Cookie导入 |
 | `--whitelist` | | 否 | 教师白名单，仅评价这些教师的课程 |
-| `--blacklist` | | 否 | 教师黑名单，排除这些教师的课程 |
+| `--blacklist` | | 否 | 教师黑名单，排除指定教师的课程 |
 | `--no-headless` | | 否 | 显示浏览器窗口（调试用） |
 | `--api-only` | | 否 | 仅使用API模式，不回退到浏览器自动化 |
 
@@ -157,10 +178,18 @@ finally:
 2. **Chrome Cookie导入**：从本地Chrome浏览器导入CAS Cookie
 3. **API+MFA登录**：
    - 访问CAS登录页，获取execution参数
-   - RSA加密密码，提交登录表单
+   - RSA加密密码，提交登录表单（failN="-1"避免CAS误判触发验证码）
    - 如需MFA：调用detect接口检查设备是否已信任
-     - 已信任设备（`need=False`）：直接跳过MFA
-     - 未信任设备：发送短信验证码 → 用户输入 → 验证 → 可选设为可信客户端
+     - 已信任设备（`need=false`）：自动跳过MFA，提交trustAgent="true"
+     - 未信任设备：检测可用MFA验证方式（qrcode/appPush/securephone）
+       - 单种方式：直接使用该方式验证
+       - 多种方式：用户手动选择验证方式
+       - qrcode（APP扫码）：下载二维码PNG → 终端渲染显示 → 用户APP扫码 → 轮询状态
+       - appPush（APP推送）：发起推送 → 轮询状态 → 用户APP确认
+       - securephone（短信验证码）：发送短信 → 用户输入验证码 → 验证
+       - qrcode/appPush失败时自动回退securephone
+       - 验证成功后可选设为可信客户端
+   - fpVisitorId默认值为"00000000000000000000000000000000"（已注册的信任设备标识）
    - 跟随SSO重定向获取Token
 4. **Playwright回退**：以上方式均失败时，使用浏览器自动化登录
 
@@ -179,7 +208,9 @@ finally:
 - **AuthKey**：RSA-1024 + PKCS1_v1_5，加密 `DetailId&PersonCode`，输出hex字符串
 - **Token管理**：从CAS登录重定向提取，存入Cookie复用文件
 - **Cookie存储**：`~/.zzu_eval_cookies.json`，权限0600，包含cookies和fp_visitor_id
-- **可信客户端**：基于fpVisitorId标识设备，CAS detect接口返回`need=False`时跳过MFA
+- **MFA验证方式**：支持三种验证方式 - qrcode（APP扫码，下载PNG二维码并用Pillow库渲染到终端）、appPush（APP推送，轮询状态SENT→SCAND→VALID）、securephone（短信验证码），qrcode/appPush失败时自动回退securephone
+- **可信客户端**：基于fpVisitorId标识设备，默认值"00000000000000000000000000000000"（已注册的信任设备标识），CAS detect接口返回`need=false`时自动跳过MFA，同时提交trustAgent="true"
+- **验证码规避**：failN="-1"参数避免CAS误判触发图像验证码，已移除图像验证码识别功能
 
 ## 文件说明
 
@@ -192,13 +223,15 @@ finally:
 - 密码通过RSA加密后传输，不会以明文形式发送
 - Cookie文件存储在用户主目录，权限设为仅所有者可读
 - AES加密密钥为前端SPA内置密钥，用于API协议兼容，非用户凭据
-- fpVisitorId为随机生成的设备指纹，用于可信客户端功能
+- fpVisitorId默认为"00000000000000000000000000000000"（已注册的信任设备标识），用于可信客户端功能
 - 建议使用后及时清理Cookie文件
 
 ## 注意事项
 
 - 请确保网络连接稳定
 - 首次登录需输入短信验证码，建议选择"设为可信客户端"以便后续自动登录
+- 登录成功后如选课系统未开放，程序会给出明确提示
+- failN="-1"参数可避免CAS误判触发图像验证码，已移除图像验证码识别功能（ddddocr依赖已移除）
 - 本工具仅供学习交流使用，请合理使用
 
 ## License

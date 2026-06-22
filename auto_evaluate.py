@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """ZZU 教学评价自动提交程序 - 增强版
 
 支持: Cookie复用(TGC跳过MFA)、MFA短信验证、Chrome Cookie导入、API直连、Playwright回退
@@ -13,6 +13,7 @@ import re
 import shutil
 import tempfile
 import secrets
+import logging
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -20,6 +21,8 @@ from urllib.parse import urlparse, parse_qs, unquote, quote
 
 import requests
 from bs4 import BeautifulSoup
+
+logger = logging.getLogger(__name__)
 
 # ─── 可选依赖 ───────────────────────────────────────────────
 try:
@@ -964,7 +967,6 @@ class EvalAuth:
     def _handle_mfa_after_login(self, username, encrypted_pwd, page_text, execution=""):
         """MFA安全验证流程"""
         session = self.api_client.session
-        login_url = f"{CAS_LOGIN_URL}?service={CAS_SERVICE_URL}"
 
         try:
             # Step 1: detect MFA
@@ -987,36 +989,16 @@ class EvalAuth:
                 # 设备已信任，不需要MFA，提交带mfaState的登录表单
                 print("    [MFA] 当前设备已信任，跳过安全验证")
                 trusted_mfa_state = mfa_data.get("state", "")
-                # 从MFA页面提取execution（不要重新GET登录页，会破坏session）
-                page_execution = self._extract_execution_from_page(page_text) or execution
-                form_data = {
-                    "username": username,
-                    "password": encrypted_pwd,
-                    "captcha": "",
-                    "currentMenu": "1",
-                    "failN": "-1",
-                    "mfaState": trusted_mfa_state,
-                    "execution": page_execution,
-                    "_eventId": "submit",
-                    "geolocation": "",
-                    "fpVisitorId": self.api_client.fp_visitor_id,
-                    "trustAgent": "true",
-                    "submit1": "Login1",
-                }
-                resp = session.post(
-                    f"{CAS_LOGIN_URL}?service={CAS_SERVICE_URL}",
-                    data=form_data,
-                    headers=self.FORM_HEADERS,
-                    allow_redirects=False,
-                    timeout=30,
-                )
-                if resp.status_code in (301, 302, 303, 307, 308):
-                    location = resp.headers.get("Location", "")
-                    if "ticket=" in location:
-                        return self._follow_deal_sso(resp)
-                # 如果没成功跳转，打印调试信息并继续正常MFA流程
-                print(f"    [MFA] 信任设备跳过失败(状态:{resp.status_code})，继续安全验证流程...")
+                try:
+                    return self._submit_mfa_login(
+                        username, encrypted_pwd, trusted_mfa_state, "",
+                        page_text, execution, "true"
+                    )
+                except EvalAuthError as e:
+                    # 如果没成功跳转，继续正常MFA流程
+                    print(f"    [MFA] 信任设备跳过失败({e})，继续安全验证流程...")
 
+            # 获取mfaState
             mfa_state = ""
             if detect_data.get("code") == 0 or detect_data.get("status") == 200:
                 mfa_state = mfa_data.get("state", "")
@@ -1037,7 +1019,239 @@ class EvalAuth:
             if not mfa_state:
                 raise EvalAuthError("无法获取MFA状态")
 
-            # Step 2: initByType securephone
+            # Step 2: 根据mfaType字段选择验证方式
+            mfa_type_qrcode = mfa_data.get("mfaTypeQrCode", False)
+            mfa_type_apppush = mfa_data.get("mfaTypeAppPush", False)
+            mfa_type_securephone = mfa_data.get("mfaTypeSecurePhone", False)
+
+            available_methods = []
+            if mfa_type_qrcode:
+                available_methods.append("qrcode")
+            if mfa_type_apppush:
+                available_methods.append("apppush")
+            if mfa_type_securephone:
+                available_methods.append("securephone")
+
+            # 选择验证方式
+            chosen_method = ""
+            if not available_methods:
+                raise EvalAuthError("无可用MFA验证方式")
+            elif len(available_methods) == 1:
+                chosen_method = available_methods[0]
+            else:
+                # 多种方式可用，让用户选择
+                print("    [MFA] 检测到多种验证方式可用:")
+                options = []
+                option_methods = []
+                if mfa_type_qrcode:
+                    options.append("1=APP扫码验证")
+                    option_methods.append("qrcode")
+                if mfa_type_apppush:
+                    num = len(options) + 1
+                    options.append(f"{num}=APP推送验证")
+                    option_methods.append("apppush")
+                if mfa_type_securephone:
+                    num = len(options) + 1
+                    options.append(f"{num}=短信验证码")
+                    option_methods.append("securephone")
+
+                choice = input(f"    请选择验证方式 ({', '.join(options)}，默认1): ").strip()
+
+                if choice == "" or choice == "1":
+                    chosen_method = option_methods[0] if option_methods else "securephone"
+                else:
+                    idx = int(choice) - 1 if choice.isdigit() else -1
+                    if 0 <= idx < len(option_methods):
+                        chosen_method = option_methods[idx]
+                    else:
+                        chosen_method = option_methods[0] if option_methods else "securephone"
+
+            # Step 3: 执行选定的验证方式，qrcode/apppush失败时回退securephone
+            if chosen_method == "qrcode":
+                try:
+                    return self._handle_mfa_qrcode(
+                        username, encrypted_pwd, mfa_state, page_text, execution
+                    )
+                except EvalAuthError as e:
+                    if mfa_type_securephone:
+                        print(f"    [MFA] 扫码验证失败({e})，回退到短信验证码...")
+                        return self._handle_mfa_securephone(
+                            username, encrypted_pwd, mfa_state, page_text, execution
+                        )
+                    raise
+            elif chosen_method == "apppush":
+                try:
+                    return self._handle_mfa_apppush(
+                        username, encrypted_pwd, mfa_state, page_text, execution
+                    )
+                except EvalAuthError as e:
+                    if mfa_type_securephone:
+                        print(f"    [MFA] APP推送验证失败({e})，回退到短信验证码...")
+                        return self._handle_mfa_securephone(
+                            username, encrypted_pwd, mfa_state, page_text, execution
+                        )
+                    raise
+            else:
+                return self._handle_mfa_securephone(
+                    username, encrypted_pwd, mfa_state, page_text, execution
+                )
+
+        except EvalAuthError:
+            raise
+        except EvalNetworkError:
+            raise
+        except Exception as e:
+            raise EvalAuthError(f"MFA验证流程失败: {e}")
+
+    def _handle_mfa_qrcode(self, username, encrypted_pwd, mfa_state, page_text, execution):
+        """处理MFA扫码验证流程"""
+        session = self.api_client.session
+        try:
+            # Step 1: initByType/qrcode
+            init_resp = session.get(
+                f"{CAS_BASE}/mfa/initByType/qrcode",
+                params={"state": mfa_state},
+                timeout=15,
+            )
+            init_data = {}
+            try:
+                init_data = init_resp.json()
+            except Exception:
+                pass
+
+            if init_data.get("code") != 0:
+                raise EvalAuthError(f"初始化扫码验证失败: {init_data.get('error', '未知错误')}")
+
+            mfa_info = init_data.get("data", {})
+            attest_server_url = mfa_info.get("attestServerUrl", "")
+            gid = mfa_info.get("gid", "")
+
+            if not attest_server_url or not gid:
+                raise EvalAuthError("无法获取扫码验证信息")
+
+            # Step 2: send qrcode
+            send_resp = session.post(
+                f"{attest_server_url}/api/guard/qrcode/send",
+                json={"gid": gid},
+                timeout=15,
+            )
+            send_data = {}
+            try:
+                send_data = send_resp.json()
+            except Exception:
+                pass
+
+            callback_code = send_data.get("data", {}).get("callbackCode", "")
+            scan_qrcode_url = send_data.get("data", {}).get("scanQrcode", "")
+            print("    [MFA] 请使用郑大APP扫描二维码验证")
+            if callback_code:
+                print(f"    [MFA] 确认码: {callback_code}")
+            # 在终端渲染二维码
+            if scan_qrcode_url:
+                self._display_qrcode_in_terminal(scan_qrcode_url)
+
+            # Step 3: 轮询status
+            success, message = self._poll_mfa_status(attest_server_url, "qrcode", gid, timeout=120)
+
+            if not success:
+                raise EvalAuthError(message)
+
+            print("    [MFA] 扫码验证通过")
+
+            # Step 4: 询问是否设为可信客户端
+            trust_choice = input("    是否将当前设备设为可信客户端？后续登录可跳过安全验证 (y/n): ").strip().lower()
+            trust_agent = "true" if trust_choice == "y" else ""
+            if trust_agent:
+                print("    [✓] 已设为可信客户端")
+
+            # Step 5: 提交登录表单
+            return self._submit_mfa_login(
+                username, encrypted_pwd, mfa_state, callback_code,
+                page_text, execution, trust_agent
+            )
+
+        except EvalAuthError:
+            raise
+        except EvalNetworkError:
+            raise
+        except Exception as e:
+            raise EvalAuthError(f"扫码验证流程失败: {e}")
+
+    def _handle_mfa_apppush(self, username, encrypted_pwd, mfa_state, page_text, execution):
+        """处理MFA APP推送验证流程"""
+        session = self.api_client.session
+        try:
+            # Step 1: initByType/appPush
+            init_resp = session.get(
+                f"{CAS_BASE}/mfa/initByType/appPush",
+                params={"state": mfa_state},
+                timeout=15,
+            )
+            init_data = {}
+            try:
+                init_data = init_resp.json()
+            except Exception:
+                pass
+
+            if init_data.get("code") != 0:
+                raise EvalAuthError(f"初始化APP推送验证失败: {init_data.get('error', '未知错误')}")
+
+            mfa_info = init_data.get("data", {})
+            attest_server_url = mfa_info.get("attestServerUrl", "")
+            gid = mfa_info.get("gid", "")
+
+            if not attest_server_url or not gid:
+                raise EvalAuthError("无法获取APP推送验证信息")
+
+            # Step 2: send apppush
+            send_resp = session.post(
+                f"{attest_server_url}/api/guard/apppush/send",
+                json={"gid": gid},
+                timeout=15,
+            )
+            send_data = {}
+            try:
+                send_data = send_resp.json()
+            except Exception:
+                pass
+
+            callback_code = send_data.get("data", {}).get("callbackCode", "")
+            print("    [MFA] 已发送APP推送验证，请在手机上确认")
+            if callback_code:
+                print(f"    [MFA] 确认码: {callback_code}")
+
+            # Step 3: 轮询status
+            success, message = self._poll_mfa_status(attest_server_url, "apppush", gid, timeout=120)
+
+            if not success:
+                raise EvalAuthError(message)
+
+            print("    [MFA] APP推送验证通过")
+
+            # Step 4: 询问是否设为可信客户端
+            trust_choice = input("    是否将当前设备设为可信客户端？后续登录可跳过安全验证 (y/n): ").strip().lower()
+            trust_agent = "true" if trust_choice == "y" else ""
+            if trust_agent:
+                print("    [✓] 已设为可信客户端")
+
+            # Step 5: 提交登录表单
+            return self._submit_mfa_login(
+                username, encrypted_pwd, mfa_state, callback_code,
+                page_text, execution, trust_agent
+            )
+
+        except EvalAuthError:
+            raise
+        except EvalNetworkError:
+            raise
+        except Exception as e:
+            raise EvalAuthError(f"APP推送验证流程失败: {e}")
+
+    def _handle_mfa_securephone(self, username, encrypted_pwd, mfa_state, page_text, execution):
+        """处理MFA短信验证码流程"""
+        session = self.api_client.session
+        try:
+            # Step 1: initByType/securephone
             init_resp = session.get(
                 f"{CAS_BASE}/mfa/initByType/securephone",
                 params={"state": mfa_state},
@@ -1056,9 +1270,9 @@ class EvalAuth:
             if secure_phone:
                 print(f"    [MFA] 安全手机: {secure_phone[:3]}****{secure_phone[-4:]}")
 
-            # Step 3: 发送短信验证码
+            # Step 2: 发送短信验证码
             if attest_server_url and gid:
-                send_resp = session.post(
+                session.post(
                     f"{attest_server_url}/api/guard/securephone/send",
                     json={"gid": gid},
                     timeout=15,
@@ -1067,31 +1281,20 @@ class EvalAuth:
             else:
                 print("    [MFA] 尝试发送短信验证码...")
                 try:
-                    init_resp = session.get(
+                    session.get(
                         f"{CAS_BASE}/mfa/initByType/securephone",
                         params={"state": mfa_state},
                         timeout=15,
                     )
-                    if init_resp.status_code == 200:
-                        try:
-                            init_data = init_resp.json()
-                        except Exception:
-                            init_data = {}
-                        if not attest_server_url:
-                            attest_server_url = init_data.get("attestServerUrl", "")
-                        if not gid:
-                            gid = init_data.get("gid", "")
                 except Exception:
                     pass
-                if not attest_server_url or not gid:
-                    raise EvalAuthError("无法获取短信验证服务信息，发送验证码失败")
 
-            # Step 4: 用户输入验证码
+            # Step 3: 用户输入验证码
             sms_code = input("    请输入收到的短信验证码: ").strip()
             if not sms_code:
                 raise EvalAuthError("未输入短信验证码")
 
-            # Step 5: 验证短信验证码
+            # Step 4: 验证短信验证码
             if attest_server_url and gid:
                 valid_resp = session.post(
                     f"{attest_server_url}/api/guard/securephone/valid",
@@ -1102,75 +1305,220 @@ class EvalAuth:
                 if valid_data.get("data", {}).get("status") != 2:
                     raise EvalAuthError("短信验证码错误，请检查后重试")
                 print("    [MFA] 短信验证码校验通过")
-            else:
-                raise EvalAuthError("无法验证短信验证码：缺少验证服务信息")
 
-            # 询问是否设为可信客户端
+            # Step 5: 询问是否设为可信客户端
             trust_choice = input("    是否将当前设备设为可信客户端？后续登录可跳过安全验证 (y/n): ").strip().lower()
             trust_agent = "true" if trust_choice == "y" else ""
             if trust_agent:
                 print("    [✓] 已设为可信客户端")
 
-            # Step 6: 从MFA页面提取execution（不要重新GET登录页，会破坏session）
-            mfa_execution = self._extract_execution_from_page(page_text) or execution
 
-            # Step 7: 提交带MFA的登录表单
-            mfa_form_data = {
-                "username": username,
-                "password": encrypted_pwd,
-                "captcha": "",
-                "currentMenu": "1",
-                "failN": "-1",
-                "mfaState": mfa_state,
-                "code": sms_code,
-                "execution": mfa_execution,
-                "_eventId": "submit",
-                "geolocation": "",
-                "fpVisitorId": self.api_client.fp_visitor_id,
-                "trustAgent": trust_agent,
-                "submit1": "Login1",
-            }
-            try:
-                resp = session.post(
-                    f"{CAS_LOGIN_URL}?service={CAS_SERVICE_URL}",
-                    data=mfa_form_data,
-                    headers=self.FORM_HEADERS,
-                    allow_redirects=False,
-                    timeout=30,
-                )
-            except requests.RequestException as e:
-                raise EvalNetworkError(f"提交MFA验证失败: {e}")
-
-            # 检查是否302重定向含ticket
-            if resp.status_code in (301, 302, 303, 307, 308):
-                location = resp.headers.get("Location", "")
-                if "ticket=" in location:
-                    print("    [MFA] 短信验证成功！")
-                    return self._follow_deal_sso(resp)
-                # 302但不含ticket，可能是账号密码错误
-                if "/cas/a/login" in location:
-                    raise EvalAuthError("账号或密码错误")
-                raise EvalAuthError(f"MFA验证后登录失败，重定向到: {location}")
-
-            # 200响应 - MFA验证码可能过期或不匹配
-            if resp.status_code == 200:
-                page_text = resp.text
-                # 检查是否仍停留在MFA页面（验证码不匹配）
-                if "mfaState" in page_text or "安全验证" in page_text:
-                    raise EvalAuthError("短信验证码不匹配或已过期，请重试")
-                # 检查是否有账号密码错误提示
-                soup = BeautifulSoup(page_text, 'html.parser')
-                err_el = soup.find('div', {'id': 'msg'}) or soup.find('span', {'class': 'error'}) or soup.find('div', {'class': 'alert-danger'})
-                if err_el and err_el.get_text(strip=True):
-                    raise EvalAuthError(f"账号或密码错误: {err_el.get_text(strip=True)}")
-                raise EvalAuthError("MFA验证后登录失败，请检查账号密码是否正确")
+            # Step 6: 提交登录表单
+            return self._submit_mfa_login(
+                username, encrypted_pwd, mfa_state, sms_code,
+                page_text, execution, trust_agent
+            )
 
         except EvalAuthError:
             raise
         except EvalNetworkError:
             raise
         except Exception as e:
-            raise EvalAuthError(f"MFA验证流程失败: {e}")
+            raise EvalAuthError(f"短信验证流程失败: {e}")
+
+    def _submit_mfa_login(self, username, encrypted_pwd, mfa_state, code, page_text, execution, trust_agent):
+        """提交带MFA的登录表单，成功时调用self._follow_deal_sso(resp)"""
+        session = self.api_client.session
+
+        # 从MFA页面提取execution（不要重新GET登录页，会破坏session）
+        mfa_execution = self._extract_execution_from_page(page_text) or execution
+
+        mfa_form_data = {
+            "username": username,
+            "password": encrypted_pwd,
+            "captcha": "",
+            "currentMenu": "1",
+            "failN": "-1",
+            "mfaState": mfa_state,
+            "code": code,
+            "execution": mfa_execution,
+            "_eventId": "submit",
+            "geolocation": "",
+            "fpVisitorId": self.api_client.fp_visitor_id,
+            "trustAgent": trust_agent,
+            "submit1": "Login1",
+        }
+        try:
+            resp = session.post(
+                f"{CAS_LOGIN_URL}?service={CAS_SERVICE_URL}",
+                data=mfa_form_data,
+                headers=self.FORM_HEADERS,
+                allow_redirects=False,
+                timeout=30,
+            )
+        except requests.RequestException as e:
+            raise EvalNetworkError(f"提交MFA验证失败: {e}")
+
+        # 检查是否302重定向含ticket
+        if resp.status_code in (301, 302, 303, 307, 308):
+            location = resp.headers.get("Location", "")
+            if "ticket=" in location:
+                return self._follow_deal_sso(resp)
+            # 302但不含ticket，可能是账号密码错误
+            if "/cas/a/login" in location:
+                raise EvalAuthError("账号或密码错误")
+            raise EvalAuthError(f"MFA验证后登录失败，重定向到: {location}")
+
+        # 200响应 - MFA验证码可能过期或不匹配
+        if resp.status_code == 200:
+            resp_text = resp.text
+            # 检查是否仍停留在MFA页面（验证码不匹配）
+            if "mfaState" in resp_text or "安全验证" in resp_text:
+                raise EvalAuthError("验证码不匹配或已过期，请重试")
+            # 检查是否有账号密码错误提示
+            soup = BeautifulSoup(resp_text, 'html.parser')
+            err_el = soup.find('div', {'id': 'msg'}) or soup.find('span', {'class': 'error'}) or soup.find('div', {'class': 'alert-danger'})
+            if err_el and err_el.get_text(strip=True):
+                raise EvalAuthError(f"账号或密码错误: {err_el.get_text(strip=True)}")
+            raise EvalAuthError("MFA验证后登录失败，请检查账号密码是否正确")
+
+        raise EvalAuthError(f"MFA验证后登录失败，HTTP状态码: {resp.status_code}")
+
+    def _poll_mfa_status(self, attest_server_url, guard_type, gid, timeout=120):
+        """轮询MFA验证状态
+
+        Args:
+            attest_server_url: 验证服务器URL
+            guard_type: 验证类型 "qrcode" 或 "apppush"
+            gid: 会话ID
+            timeout: 超时时间（秒）
+
+        Returns:
+            (是否成功, 确认码或错误信息)
+        """
+        session = self.api_client.session
+        status_url = f"{attest_server_url}/api/guard/{guard_type}/status"
+        start_time = time.time()
+
+        status_messages = {
+            0: "初始化中",
+            1: "已发送，等待操作",
+            3: "验证失败",
+            5: "已取消",
+            8: "已扫码，请在手机上确认",
+            9: "已过期",
+        }
+
+        last_status = None
+
+        while time.time() - start_time < timeout:
+            try:
+                resp = session.post(status_url, json={"gid": gid}, timeout=10)
+                resp_data = resp.json()
+                status = resp_data.get("data", {}).get("status")
+
+                if status == 2:
+                    # 验证通过
+                    print("    [MFA] 验证通过")
+                    return True, "验证通过"
+                elif status in (3, 5, 9):
+                    # 失败/取消/过期
+                    return False, status_messages.get(status, f"验证失败(状态码:{status})")
+
+                # status 0/1/8, 状态变化时打印提示
+                if status in (0, 1, 8) and status != last_status:
+                    msg = status_messages.get(status, f"状态码:{status}")
+                    print(f"    [MFA] {msg}")
+                    last_status = status
+
+                time.sleep(3)
+            except Exception:
+                time.sleep(3)
+
+        return False, "验证超时"
+
+    def _display_qrcode_in_terminal(self, url: str) -> None:
+        """下载二维码图片并渲染到终端"""
+        try:
+            from PIL import Image
+            import io as _io
+
+            # 下载二维码PNG图片
+            resp = self.api_client.session.get(url, timeout=15)
+            if resp.status_code != 200:
+                raise Exception(f"下载二维码图片失败: HTTP {resp.status_code}")
+
+            # 用PIL打开图片，转为1-bit黑白
+            img = Image.open(_io.BytesIO(resp.content)).convert("1")
+            pixels = img.load()
+            width, height = img.size
+
+            # 检测模块大小：通过行重复周期
+            first_content_y = 0
+            for y in range(height):
+                if any(pixels[x, y] == 0 for x in range(width)):
+                    first_content_y = y
+                    break
+
+            prev_line = tuple(pixels[x, first_content_y] for x in range(width))
+            module_size = 1
+            for y in range(first_content_y + 1, height):
+                curr_line = tuple(pixels[x, y] for x in range(width))
+                if curr_line != prev_line:
+                    module_size = y - first_content_y
+                    break
+
+            # 找到QR码内容区域边界
+            start_x = 0
+            for x in range(width):
+                if any(pixels[x, y] == 0 for y in range(height)):
+                    start_x = (x // module_size) * module_size
+                    break
+
+            start_y = (first_content_y // module_size) * module_size
+
+            end_x = width - 1
+            for x in range(width - 1, -1, -1):
+                if any(pixels[x, y] == 0 for y in range(height)):
+                    end_x = x
+                    break
+
+            end_y = height - 1
+            for y in range(height - 1, -1, -1):
+                if any(pixels[x, y] == 0 for x in range(width)):
+                    end_y = y
+                    break
+
+            modules_x = (end_x - start_x + 1) // module_size
+            modules_y = (end_y - start_y + 1) // module_size
+
+            # 渲染到终端，使用双行高方块字符使QR码更接近正方形
+            for row in range(0, modules_y, 2):
+                line = []
+                for col in range(modules_x):
+                    px = start_x + col * module_size + module_size // 2
+                    py1 = start_y + row * module_size + module_size // 2
+                    top = 0 <= py1 < height and 0 <= px < width and pixels[px, py1] == 0
+
+                    py2 = start_y + (row + 1) * module_size + module_size // 2
+                    bottom = 0 <= py2 < height and 0 <= px < width and pixels[px, py2] == 0
+
+                    if top and bottom:
+                        line.append("█")
+                    elif top and not bottom:
+                        line.append("▀")
+                    elif not top and bottom:
+                        line.append("▄")
+                    else:
+                        line.append(" ")
+                print("    " + "".join(line))
+
+        except ImportError:
+            print(f"    [MFA] 二维码图片URL: {url}")
+            print("    [MFA] (安装Pillow库可在终端直接显示二维码: pip install Pillow)")
+        except Exception as e:
+            logger.debug(f"渲染终端二维码失败: {e}")
+            print(f"    [MFA] 二维码图片URL: {url}")
 
     def _cas_sso_login_with_mfa(self, username, password):
         """CAS SSO登录 - 自动处理MFA"""
